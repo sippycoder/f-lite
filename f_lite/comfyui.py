@@ -3,6 +3,7 @@ import numpy as np
 from PIL import Image
 import os
 import comfy.model_management as mm
+from .pipeline import FLitePipeline, APGConfig
 
 def pil2tensor(image: Image) -> torch.Tensor:
     return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)
@@ -43,6 +44,7 @@ class FLiteNode:
                 "steps": ("INT", {"default": 30, "min": 1, "max": 100, "step": 1}),
                 "width": ("INT", {"default": 1344, "min": 16, "max": 4096, "step": 16}),
                 "height": ("INT", {"default": 896, "min": 16, "max": 4096, "step": 16}),
+                "APG": ("BOOLEAN", {"default": False,}),
                 "compile_model": ("BOOLEAN", {"default": False,}),
                 "cpu_offload": ("BOOLEAN", {"default": True,}),
             },
@@ -55,11 +57,9 @@ class FLiteNode:
     FUNCTION = 'f_lite'
     CATEGORY = 'F-Lite'
 
-    def f_lite(self, model, prompt, negative_prompt, seed, guidance_scale, batch_size, steps, width, height, compile_model, cpu_offload):
+    def f_lite(self, model, prompt, negative_prompt, seed, guidance_scale, batch_size, steps, width, height, APG, compile_model, cpu_offload):
 
         ret_images = []
-
-        from .pipeline import FLitePipeline
 
         if self.model_name != model or self.compile_model != compile_model or self.cpu_offload != cpu_offload:
             model_path = check_and_download_model(model, f"Freepik/{model}")
@@ -83,6 +83,8 @@ class FLiteNode:
             self.pipe.vae.enable_slicing()
             self.pipe.vae.enable_tiling()
 
+        # Create APGConfig based on the input parameter
+        apg_config = APGConfig(enabled=APG)
 
         image = self.pipe(
             prompt=prompt,
@@ -93,6 +95,7 @@ class FLiteNode:
             width=width,
             height=height,
             generator=torch.Generator().manual_seed(seed),
+            apg_config=apg_config,
         ).images
         for i in image:
             ret_images.append(pil2tensor(i))

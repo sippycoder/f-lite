@@ -72,7 +72,7 @@
       },
       "widgets_values": [
         "",
-        " A majestic parrot with a long, curved beak and a curved tusk sits on a rocky outcrop, surrounded by lush greenery. The sun is setting, casting a warm orange glow on the parrot's fur. The air is filled with the sweet scent of blooming flowers, and a gentle breeze rustles the leaves of nearby trees. The parrot's eyes are closed, and its tongue lolls out of its mouth as it listens intently to the sounds of the forest."
+        "The regal red parrot perches on the branches of a tall oak tree, its long legs splayed out as it gazes out at the lush greenery below. The leaves rustle gently in the breeze, and the sun filters through the leaves, casting dappled shadows on the forest floor. The parrot's eyes are closed, and its tongue lolls out of its mouth as it savors the peaceful surroundings."
       ]
     },
     {
@@ -104,7 +104,7 @@
       },
       "widgets_values": [
         "Expand the following prompt to add more detail: ",
-        "A parrot",
+        "A red parrot perched in a tree",
         512
       ]
     },
@@ -155,6 +155,7 @@
         30,
         1024,
         1024,
+        false,
         false,
         true
       ]
