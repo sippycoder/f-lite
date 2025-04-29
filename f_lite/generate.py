@@ -16,7 +16,7 @@ def generate_images(
     model: str = "Freepik/F-Lite",
     negative_prompt: Optional[str] = None,
     seed: int = 0,
-    guidance_scale: float = 3.5,
+    guidance_scale: float = 6,
     steps: int = 30,
     width: int = 1344,
     height: int = 896,

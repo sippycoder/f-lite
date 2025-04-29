@@ -162,7 +162,7 @@ class FLitePipeline(DiffusionPipeline):
         height: Optional[int] = 1024,
         width: Optional[int] = 1024,
         num_inference_steps: int = 30,
-        guidance_scale: float = 3.0,
+        guidance_scale: float = 6.0,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: int = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,

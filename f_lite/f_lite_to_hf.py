@@ -62,7 +62,7 @@ def f_lite_to_hf(
     test_image_height: int = 1024,
     test_image_width: int = 1024,
     test_num_inference_steps: int = 30,
-    test_guidance_scale: float = 3.0,
+    test_guidance_scale: float = 6.0,
     test_seed: int = 43,
 ):
     """

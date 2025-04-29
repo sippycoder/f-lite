@@ -88,7 +88,7 @@ python -m f_lite.generate \
   --width 1344 \
   --height 896 \
   --steps 30 \
-  --guidance_scale 3.5 \
+  --guidance_scale 6 \
   --seed 42
 ```
 
