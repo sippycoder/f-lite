@@ -27,7 +27,7 @@ Read our [technical report](assets/F%20Lite%20Technical%20Report.pdf) for more d
 
 ## Project updates
 
-* 🎉 **April 28, 2025**: F Lite is released!
+* 🎉 **April 29, 2025**: F Lite is released!
 
 ## Weights
 
