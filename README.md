@@ -32,10 +32,10 @@ Read our [technical report](assets/F%20Lite%20Technical%20Report.pdf) for more d
 ## Weights
 
 
-| Model Version | Link | Description | Notes | Demo |
-|---------------|------|-------------|-------|------|
-| **Standard Model** | [Freepik/F-Lite](https://huggingface.co/Freepik/F-Lite) | Base model suitable for general-purpose image generation | - | [Demo](https://huggingface.co/spaces/Freepik/F-Lite) |
-| **Texture Model** | [Freepik/F-Lite-Texture](https://huggingface.co/Freepik/F-Lite-Texture) | Specialized version with richer textures and enhanced details | • Requires more detailed prompts<br>• May be more prone to malformations<br>• Less effective for vector-style imagery | [Demo](https://huggingface.co/spaces/Freepik/F-Lite-Texture) |
+| Model Version | Link | Description | Notes | HF Demo | Fal.ai Demo |
+|---------------|------|-------------|-------|---------|------------|
+| **Standard Model** | [Freepik/F-Lite](https://huggingface.co/Freepik/F-Lite) | Base model suitable for general-purpose image generation | - | [Demo](https://huggingface.co/spaces/Freepik/F-Lite) | [Fal.ai Demo](https://fal.ai/models/fal-ai/f-lite/standard) |
+| **Texture Model** | [Freepik/F-Lite-Texture](https://huggingface.co/Freepik/F-Lite-Texture) | Specialized version with richer textures and enhanced details | • Requires more detailed prompts<br>• May be more prone to malformations<br>• Less effective for vector-style imagery | [Demo](https://huggingface.co/spaces/Freepik/F-Lite-Texture) | [Fal.ai Demo](https://fal.ai/models/fal-ai/f-lite/texture) |
 
 ## ComfyUI Nodes
 
