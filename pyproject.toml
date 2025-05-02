@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "f-lite" 
+version = "0.1.0"
+description = "F Lite is a 10B parameter diffusion model created by Freepik and Fal, trained exclusively on copyright-safe and SFW content"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+keywords = ["text-to-image", "AI", "diffusion"]
+authors = [
+   { name="Simo Ryu", email="simo@fal.ai" },
+   { name="Pengqi Lu", email="lpengqi@freepik.com" },
+   { name="Javier Martín Juan", email="javier.martin@freepik.com" },
+   { name="Iván de Prado Alonso", email="ideprado@freepik.com" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: CreativeML Open RAIL-M",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Graphics",
+]
+
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+where = ["."]
