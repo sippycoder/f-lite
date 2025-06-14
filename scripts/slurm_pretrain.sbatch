@@ -88,6 +88,9 @@ declare -a TRAIN_SCRIPT_ARGS=(
     "-m"
     "f_lite.train"
 )
+
+BUCKET_NAME="train-bucket-1"
+
 declare -a TRAINING_ARGS=(
     "--vae_path" "/fsx/checkpoints/f_lite/vae"
     "--text_encoder_path" "/fsx/checkpoints/f_lite/text_encoder"
@@ -96,7 +99,7 @@ declare -a TRAINING_ARGS=(
     "--model_depth" "24"
     "--model_head_dim" "256"
     "--rope_base" "10000"
-    "--train_data_path" "train-bucket-8"
+    "--train_data_path" "${BUCKET_NAME}"
     "--base_image_dir" "/fsx/metadata/training"
     "--image_column" "media_path"
     "--caption_column" "captions"
@@ -110,14 +113,16 @@ declare -a TRAINING_ARGS=(
     "--lr_scheduler" "cosine"
     "--num_warmup_steps" "4000"
     "--seed" "47"
-    "--output_dir" "/fsx/checkpoints/f_lite/pretrain_v0_caption_dropout"
+    "--output_dir" "/fsx/checkpoints/f_lite/${BUCKET_NAME}"
     "--checkpointing_steps" "5000"
-    "--checkpoints_total_limit" "10"
+    "--resume_from_checkpoint" "latest"
     "--mixed_precision" "bf16"
     "--report_to" "wandb"
     "--project_name" "ablations"
-    "--run_name" "f_lite_pretrain_v0"
+    "--run_name" "f_lite_pretrain_v1_${BUCKET_NAME}"
     "--batch_multiplicity" "1"
+    "--sample_every" "5000"
+    "--sample_prompts_file" "prompts.txt"
 )
 
 echo "--- srun command execution ---"
