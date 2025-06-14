@@ -124,13 +124,15 @@ class BaseDataset(Dataset):
         collection_name: str,
         root_dir: str = "/fsx/metadata/training",
         root_dir_type: str = "parquet",
+        debug: bool = False,
     ) -> None:
         super().__init__()
         self.collection_name = collection_name
         self.data = None
         self.root_dir = root_dir
         self.root_dir_type = root_dir_type
-
+        self.debug = debug
+        
         logging.info("Data partition begins!")
         start_time = time.time()  # Record the start time
         
@@ -140,11 +142,12 @@ class BaseDataset(Dataset):
             parquet_files = glob.glob(os.path.join(self.root_dir, self.collection_name, "*/*/*.parquet"))
             for file in tqdm(parquet_files, desc=f"Loading data"):
                 df = pd.read_parquet(file)
+                df = df[df["media_source"] != "laion"]
                 data.extend(df.to_dict(orient="records"))
                 
                 # Note: used for debugging
-                # if len(data) > 100000:
-                #     break
+                if self.debug and len(data) > 100000:
+                    break
         else:
             raise ValueError(f"Invalid Root Directory Type. Set root_dir_type to 'json' or 'parquet'")
 
@@ -177,12 +180,14 @@ class ImageDataset(BaseDataset):
         random_flip=False,
         keep_aspect_ratio=True,
         root_dir_type="parquet",
-        base_url="s3://worldmodeldata-prod"
+        base_url="s3://worldmodeldata-prod",
+        debug=False,
     ) -> None:
         super().__init__(
             collection_name=data_path,
             root_dir=base_image_dir,
             root_dir_type=root_dir_type,
+            debug=debug,
         )
         self.image_column = image_column
         self.caption_column = caption_column
@@ -286,7 +291,9 @@ class ImageDataset(BaseDataset):
         caption = sample[self.caption_column]
         if isinstance(caption, tuple) or isinstance(caption, list) or isinstance(caption, np.ndarray):
             caption = list(caption)
-            caption = random.choice(caption)
+            if len(caption) == 0:
+                logging.warning(f"The sample {sample} has no captions")
+            caption = random.choice(caption) if len(caption) > 0 else ""
 
         if not isinstance(caption, str):
             logging.warning(f"Expected string but got {type(caption)}:{caption}")
@@ -294,7 +301,6 @@ class ImageDataset(BaseDataset):
         return_sample["caption"] = caption
         
         image, success = self.client(sample[self.image_column])
-        print(f"{idx} :: Success: {success}")
         if success:
             return_sample[self.image_column] = self.image_processing.transform(image)
         else:
@@ -303,8 +309,6 @@ class ImageDataset(BaseDataset):
             return_sample["_id"] = "-1"
             return_sample["caption"] = ""
         
-        print(f"{idx} :: {return_sample['_id']}")
-
         # Return image and metadata
         return (
             return_sample[self.image_column],
@@ -339,6 +343,7 @@ if __name__ == "__main__":
         base_image_dir="/fsx/metadata/training",
         root_dir_type="parquet",
         resolution=256,
+        debug=True,
     )
     
     from PIL import Image
