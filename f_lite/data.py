@@ -271,7 +271,6 @@ class ImageDataset(BaseDataset):
             # Catching a broad exception. 
             # For production, you might want to catch more specific Boto3 exceptions like ClientError
             logging.warn(f"Error downloading image from S3 {imageUrl}: {str(e)}")
-            print(f"Error downloading image from S3 {imageUrl}: {str(e)}")
             return self.place_holder_image, False # Signal failure
 
         
