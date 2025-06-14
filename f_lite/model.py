@@ -14,6 +14,13 @@ from peft import get_peft_model_state_dict, set_peft_model_state_dict
 from torch import nn
 
 
+def kaiming_init(m):
+    if isinstance(m, (nn.Linear, nn.Conv2d)):
+        nn.init.kaiming_normal_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+
 def timestep_embedding(t, dim, max_period=10000):
     half = dim // 2
     freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
@@ -90,6 +97,7 @@ class Attention(nn.Module):
             self.lambda_param = nn.Parameter(torch.tensor(0.5).reshape(1))
 
         self.qk_norm = QKNorm(self.head_dim)
+        self.apply(kaiming_init)
 
     def forward(self, x, context=None, v_0=None, rope=None):
         if self.is_self_attn:
@@ -180,6 +188,7 @@ class DiTBlock(nn.Module):
 
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True))
 
+        self.apply(kaiming_init)
         self.adaLN_modulation[-1].weight.data.zero_()
         self.adaLN_modulation[-1].bias.data.zero_()
 
@@ -231,6 +240,7 @@ class PatchEmbed(nn.Module):
         super().__init__()
         self.patch_proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.patch_size = patch_size
+        self.apply(kaiming_init)
 
     def forward(self, x):
         B, C, H, W = x.shape
