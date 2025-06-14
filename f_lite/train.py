@@ -25,11 +25,18 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
+from f_lite.data import ImageDataset
 from f_lite.pipeline import FLitePipeline
 from f_lite.precomputed_utils import (
     create_precomputed_data_loader,
     forward_with_precomputed_data,
 )
+from diffusers import AutoencoderKL
+from transformers import T5EncoderModel, T5TokenizerFast
+from f_lite.model import DiT
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # Set up logger
 logger = get_logger(__name__)
@@ -47,8 +54,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="DiT (Diffusion Transformer) Fine-tuning Script")
     
     # Model parameters
-    parser.add_argument("--pretrained_model_path", type=str, default=None, required=True,
+    parser.add_argument("--pretrained_model_path", type=str, default=None, required=False,
                         help="Path to pretrained model")
+    parser.add_argument("--vae_path", type=str, default=None, required=False,
+                        help="Path to pretrained VAE")
+    parser.add_argument("--text_encoder_path", type=str, default=None, required=False,
+                        help="Path to pretrained text encoder")
+    parser.add_argument("--tokenizer_path", type=str, default=None, required=False,
+                        help="Path to pretrained tokenizer")
     parser.add_argument("--model_width", type=int, default=3072, 
                         help="Model width")
     parser.add_argument("--model_depth", type=int, default=40,
@@ -209,111 +222,6 @@ class ResolutionBucketSampler(torch.utils.data.BatchSampler):
         else:
             return sum((len(indices) + self.batch_size - 1) // self.batch_size for indices in self.buckets.values())
 
-class DiffusionDataset(Dataset):
-    """
-    Dataset for loading images and captions for DiT fine-tuning.
-    """
-    def __init__(
-        self,
-        data_path,
-        base_image_dir=None,
-        image_column="image_path",
-        caption_column="caption",
-        resolution=512,
-        center_crop=True,
-        random_flip=False,
-        keep_aspect_ratio=True,
-    ):
-        self.resolution = resolution  # Can be None to keep native resolution
-        self.center_crop = center_crop
-        self.random_flip = random_flip
-        self.keep_aspect_ratio = keep_aspect_ratio
-        self.base_image_dir = base_image_dir
-        
-        # Load data from CSV or directory
-        self.data_entries = []
-        
-        if data_path.endswith('.csv'):
-            df = pd.read_csv(data_path)
-            for _, row in df.iterrows():
-                image_path = row[image_column]
-                if base_image_dir is not None:
-                    image_path = os.path.join(base_image_dir, image_path)
-                
-                caption = row[caption_column] if caption_column in df.columns else ""
-                self.data_entries.append({
-                    "image_path": image_path,
-                    "caption": caption
-                })
-        else:
-            # Assume it's a directory containing images
-            image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
-            for file in os.listdir(data_path):
-                if any(file.lower().endswith(ext) for ext in image_extensions):
-                    image_path = os.path.join(data_path, file)
-                    # Use filename as caption if no captions provided
-                    caption = os.path.splitext(file)[0].replace('_', ' ').replace('-', ' ')
-                    self.data_entries.append({
-                        "image_path": image_path,
-                        "caption": caption
-                    })
-                    
-        print(f"Loaded dataset with {len(self.data_entries)} entries")
-                    
-        # Image transforms
-        self.image_transforms = self._get_transforms()
-        
-    def _get_transforms(self):
-        """Define image transformations with options to skip preprocessing."""
-    
-        transform_list = []
-    
-        # Only resize if resolution is specified
-        if self.resolution is not None:
-            if self.keep_aspect_ratio:
-                # Resize maintaining aspect ratio
-                transform_list.append(transforms.Resize(
-                    self.resolution, 
-                    interpolation=transforms.InterpolationMode.BILINEAR
-                ))
-            else:
-                # Resize to exact dimensions
-                transform_list.append(transforms.Resize(
-                    (self.resolution, self.resolution), 
-                    interpolation=transforms.InterpolationMode.BILINEAR
-                ))
-
-        # Add crop only if requested
-        if self.center_crop and self.resolution is not None:
-            transform_list.append(transforms.CenterCrop(self.resolution))
-    
-        # Add flip only if requested
-        if self.random_flip:
-            transform_list.append(transforms.RandomHorizontalFlip())
-
-        # Always convert to tensor
-        transform_list.append(transforms.ToTensor())
-     
-        return transforms.Compose(transform_list)
-        
-    def __len__(self):
-        return len(self.data_entries)
-    
-    def __getitem__(self, index):
-        entry = self.data_entries[index]
-        
-        # Load and preprocess image
-        image = Image.open(entry["image_path"]).convert("RGB")
-        image = exif_transpose(image)  # Handle EXIF orientation
-        image_tensor = self.image_transforms(image)
-        
-        # Return image and metadata
-        return (
-            image_tensor,
-            [{
-                "long_caption": entry["caption"],
-            }]
-        )
 
 def create_data_loader(
     data_path,
@@ -336,7 +244,7 @@ def create_data_loader(
             torch.cuda.manual_seed_all(seed)
     
     # Create dataset
-    dataset = DiffusionDataset(
+    dataset = ImageDataset(
         data_path=data_path,
         base_image_dir=base_image_dir,
         resolution=resolution,
@@ -452,8 +360,6 @@ def forward(
     """
     (images_vae, metadatas) = batch
 
-    images_vae.sub_(0.5).mul_(2.0)  # Normalize to [-1, 1]
-    
     # Get captions from metadata
     captions = [metadata["long_caption"][0] for metadata in metadatas]
     
@@ -486,9 +392,9 @@ def forward(
         vae_latent = vae_latent.repeat(batch_multiplicity, 1, 1, 1)
         caption_encoded = caption_encoded.repeat(batch_multiplicity, 1, 1)
         
-        # Randomly zero out some caption_encoded (simulates classifier-free guidance)
-        do_zero_out = torch.rand(caption_encoded.shape[0], device=device) < 0.01
-        caption_encoded[do_zero_out] = 0
+    # Randomly zero out some caption_encoded (simulates classifier-free guidance)
+    do_zero_out = torch.rand(caption_encoded.shape[0], device=device) < 0.1
+    caption_encoded[do_zero_out] = 0
     
     # Batch size rampup - gradually increase batch size during training
     if bs_rampup is not None and global_step < bs_rampup:
@@ -632,7 +538,7 @@ def sample_images(
             
             latent_height = image_height // 8
             latent_width = image_width // 8
-            latent_shape = (batch_size, 16, latent_height, latent_width)  # 16 channels not 4
+            latent_shape = (batch_size, vae_model.config.latent_channels, latent_height, latent_width)
             latents = torch.randn(latent_shape, device=device, generator=generator, dtype=torch.float32)
             
             # Setup timesteps with proper scaling
@@ -683,7 +589,7 @@ def sample_images(
             prompt_slug = prompt[:40].replace(" ", "_").replace(".", "").replace(",", "")
             image_path = os.path.join(samples_dir, f"sample_{global_step}_{i}_{prompt_slug}.png")
             pil_image.save(image_path)
-             
+            
     # Restore original training state
     dit_model.train(previous_training_state)
     
@@ -738,22 +644,46 @@ def train(args):
     logger.info(f"Using random seed: {common_seed}")
     
     # Initialize wandb if needed
-    if accelerator.is_main_process and args.report_to in ["wandb", "all"]:
-        import wandb
+    if args.report_to in ["wandb", "all"]:
+        run_name = args.run_name if args.run_name else f"DiT-pretrain-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
         
-        run_name = args.run_name if args.run_name else f"DiT-finetune-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
-        
-        wandb.init(
-            project=args.project_name,
-            name=run_name,
+        # Let accelerator handle wandb initialization
+        accelerator.init_trackers(
+            project_name=args.project_name,
             config=vars(args),
+            init_kwargs={"wandb": {"name": run_name}}
         )
      
-    logger.info(f"Loading model from {args.pretrained_model_path}")
-    pipeline = FLitePipeline.from_pretrained(
-        args.pretrained_model_path,
-        torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else None
-    )
+    if args.pretrained_model_path is not None:
+        logger.info(f"Loading model from {args.pretrained_model_path}")
+        pipeline = FLitePipeline.from_pretrained(
+            args.pretrained_model_path,
+            torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else None
+        )
+    else:
+        vae = AutoencoderKL.from_pretrained(args.vae_path)
+        text_encoder = T5EncoderModel.from_pretrained(args.text_encoder_path)
+        tokenizer = T5TokenizerFast.from_pretrained(args.tokenizer_path)
+        dit_model = DiT(
+            in_channels=vae.config.latent_channels,
+            patch_size=2,
+            hidden_size=args.model_width,
+            depth=args.model_depth,
+            num_heads=args.model_width // args.model_head_dim,
+            mlp_ratio=4.0,
+            cross_attn_input_size=text_encoder.config.d_model,
+            residual_v=False,
+            train_bias_and_rms=True,
+            use_rope=True,
+            gradient_checkpoint=False,
+            dynamic_softmax_temperature=False,
+            rope_base=args.rope_base,
+        )
+        pipeline = FLitePipeline(
+            dit_model=dit_model,
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer)
 
     # Load only the models needed based on precomputed status
     if args.use_precomputed_data:
@@ -1090,6 +1020,34 @@ def train(args):
                         "train/epoch": epoch,
                         "train/step": global_step,
                     }
+
+                    # Log average bin loss
+                    for i in range(10):
+                        if diffusion_loss_binning_count[i] > 0:
+                            avg_bin_loss = (
+                                diffusion_loss_binning[i]
+                                / diffusion_loss_binning_count[i]
+                            )
+                            logs[f"metrics/avg_loss_bin_{i}"] = avg_bin_loss
+                    
+                    # Log bin counts as a histogram
+                    if any(diffusion_loss_binning_count.values()):
+                        for tracker in accelerator.trackers:
+                            if tracker.name == "wandb":
+                                import wandb
+                                raw_data = []
+                                for bin_idx, count in diffusion_loss_binning_count.items():
+                                    raw_data.extend([bin_idx] * int(count))
+                                tracker.log(
+                                    {"metrics/diffusion_loss_bin_counts": wandb.Histogram(raw_data)},
+                                    step=global_step,
+                                )
+
+                    # Reset binning stats for next logging interval
+                    diffusion_loss_binning.clear()
+                    diffusion_loss_binning.update({k: 0 for k in range(10)})
+                    diffusion_loss_binning_count.clear()
+                    diffusion_loss_binning_count.update({k: 0 for k in range(10)})
                      
                     # Log to all trackers
                     accelerator.log(logs, step=global_step)
@@ -1128,8 +1086,8 @@ def train(args):
                             device=device,
                             global_step=global_step,
                             prompts=None,  # Use default prompts as fallback
-                            image_width=1024,
-                            image_height=1024,
+                            image_width=256,
+                            image_height=256,
                             prompts_per_gpu=2,
                             prompts_file=args.sample_prompts_file,
                         )
@@ -1147,8 +1105,8 @@ def train(args):
                             device=device,
                             global_step=global_step,
                             prompts=None,  # Use default prompts as fallback
-                            image_width=1024,
-                            image_height=1024,
+                            image_width=256,
+                            image_height=256,
                             prompts_per_gpu=2,
                             prompts_file=args.sample_prompts_file,
                         )
@@ -1174,6 +1132,7 @@ def train(args):
                                 device=device,
                                 global_step=global_step,
                                 master_process=accelerator.is_main_process,
+                                return_index=-8,
                             )
                             
                             val_loss += val_total_loss.item()
@@ -1245,9 +1204,8 @@ def train(args):
             )
             logger.info(f"Saved final LoRA weights to {final_model_path}/lora_weights.pt")
         
-        # Close wandb run if it was used
-        if args.report_to in ["wandb", "all"] and wandb.run is not None:
-            wandb.finish()
+    # End training with accelerator
+    accelerator.end_training()
 
 if __name__ == "__main__":
     args = parse_args()
