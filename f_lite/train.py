@@ -4,10 +4,11 @@ import logging
 import math
 import os
 import random
+import shutil
 import time
+import wandb
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.utils.checkpoint
 from accelerate import Accelerator
@@ -16,9 +17,7 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from einops import rearrange
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 from PIL import Image
-from PIL.ImageOps import exif_transpose
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (
     get_cosine_schedule_with_warmup,
@@ -34,6 +33,7 @@ from f_lite.precomputed_utils import (
 from diffusers import AutoencoderKL
 from transformers import T5EncoderModel, T5TokenizerFast
 from f_lite.model import DiT
+from f_lite.utils import make_image_grid
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -303,15 +303,15 @@ def encode_prompt_with_t5(
     )
     text_input_ids = text_inputs.input_ids
 
-    prompt_embeds = text_encoder(
+    text_output = text_encoder(
         text_input_ids.to(device), return_dict=True, output_hidden_states=True
     )
 
-    prompt_embeds = prompt_embeds.hidden_states[return_index]
-    if return_index != -1:
-        prompt_embeds = text_encoder.encoder.final_layer_norm(prompt_embeds)
-        prompt_embeds = text_encoder.encoder.dropout(prompt_embeds)
-
+    if return_index == -1 or return_index == len(text_output.hidden_states) - 1:
+        prompt_embeds = text_output.last_hidden_state
+    else:
+        prompt_embeds = text_output.hidden_states[return_index]
+        
     dtype = text_encoder.dtype
     prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
 
@@ -361,7 +361,7 @@ def forward(
     (images_vae, metadatas) = batch
 
     # Get captions from metadata
-    captions = [metadata["long_caption"][0] for metadata in metadatas]
+    captions = metadatas[0]["long_caption"]
     
     # Process images and captions
     preprocess_start = time.time()
@@ -513,10 +513,8 @@ def sample_images(
     previous_training_state = dit_model.training
     dit_model.eval()
     
-    # Create output directory for samples
-    samples_dir = os.path.join(os.getcwd(), "samples")
-    os.makedirs(samples_dir, exist_ok=True)
-    
+    samples = []
+
     # Generate samples with correct sampling logic
     with torch.no_grad():
         for i, prompt in enumerate(prompts):
@@ -574,26 +572,17 @@ def sample_images(
             image = vae_model.decode(latents.to(torch.float32)).sample
             
             # Post-process images
-            image = (image
-                .mul(127.5)  # Scale from [-1, 1] to [-127.5, 127.5]
-                .add(127.5)  # Shift from [-127.5, 127.5] to [0, 255]
-                .clamp(0, 255)
-                .to(torch.uint8)
-                .permute(0, 2, 3, 1)  # NCHW -> NHWC
-                .cpu()
-                .numpy()[0]  # Extract first batch item
-            )
-            
-            # Convert to PIL and save
-            pil_image = Image.fromarray(image)
-            prompt_slug = prompt[:40].replace(" ", "_").replace(".", "").replace(",", "")
-            image_path = os.path.join(samples_dir, f"sample_{global_step}_{i}_{prompt_slug}.png")
-            pil_image.save(image_path)
-            
+            # VAE output is in [-1, 1] range. `save_image` with `normalize=True` will handle conversion.
+            # The previous code was incorrectly converting to uint8 and permuting dimensions.
+            samples.append(image.cpu()[0])
+
+    image_grid = make_image_grid(samples, nrow=3, normalize=True, value_range=(-1, 1))
+    
     # Restore original training state
     dit_model.train(previous_training_state)
     
-    logger.info(f"Generated samples saved to {samples_dir}")
+    return image_grid
+
 
 def train(args):
     """
@@ -879,6 +868,7 @@ def train(args):
         checkpoint_path = args.resume_from_checkpoint
         
         if checkpoint_path == "latest":
+            os.makedirs(args.output_dir, exist_ok=True)
             dirs = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")]
             if len(dirs) > 0:
                 dirs.sort(key=lambda d: int(d.split("-")[1]))
@@ -1034,7 +1024,6 @@ def train(args):
                     if any(diffusion_loss_binning_count.values()):
                         for tracker in accelerator.trackers:
                             if tracker.name == "wandb":
-                                import wandb
                                 raw_data = []
                                 for bin_idx, count in diffusion_loss_binning_count.items():
                                     raw_data.extend([bin_idx] * int(count))
@@ -1048,7 +1037,7 @@ def train(args):
                     diffusion_loss_binning.update({k: 0 for k in range(10)})
                     diffusion_loss_binning_count.clear()
                     diffusion_loss_binning_count.update({k: 0 for k in range(10)})
-                     
+                    
                     # Log to all trackers
                     accelerator.log(logs, step=global_step)
                     
@@ -1059,6 +1048,29 @@ def train(args):
                         "lr": f"{lr_scheduler.get_last_lr()[0]:.7f}",
                     }) 
                 
+                # Save checkpoint
+                if global_step % args.checkpointing_steps == 0:
+                    if accelerator.is_main_process:
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved checkpoint to {save_path}")
+
+                        # Remove old checkpoints
+                        if args.checkpoints_total_limit is not None:
+                            checkpoints = [
+                                d
+                                for d in os.listdir(args.output_dir)
+                                if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.output_dir, d))
+                            ]
+                            # Sort by step number (ascending)
+                            checkpoints.sort(key=lambda x: int(x.split("-")[1]))
+
+                            if len(checkpoints) > args.checkpoints_total_limit:
+                                num_to_delete = len(checkpoints) - args.checkpoints_total_limit
+                                for ckpt_to_delete in checkpoints[:num_to_delete]:
+                                    shutil.rmtree(os.path.join(args.output_dir, ckpt_to_delete))
+                                    logger.info(f"Removed old checkpoint: {ckpt_to_delete}")
+
                 # Sample images
                 if global_step % args.sample_every == 0 and accelerator.is_main_process:
                     # For sampling, we need VAE and text encoder
@@ -1078,7 +1090,7 @@ def train(args):
                         temp_tokenizer = temp_pipeline.tokenizer
 
                         # Use temporary models for sampling
-                        sample_images(
+                        image_grid = sample_images(
                             dit_model=accelerator.unwrap_model(dit_model),
                             vae_model=temp_vae,
                             text_encoder=temp_text_encoder,
@@ -1097,7 +1109,7 @@ def train(args):
                         torch.cuda.empty_cache()
                     else:
                         # Use existing models
-                        sample_images(
+                        image_grid = sample_images(
                             dit_model=accelerator.unwrap_model(dit_model),
                             vae_model=vae_model,
                             text_encoder=text_encoder,
@@ -1110,6 +1122,11 @@ def train(args):
                             prompts_per_gpu=2,
                             prompts_file=args.sample_prompts_file,
                         )
+                
+                    # Save image grid to wandb
+                    accelerator.log({
+                        "samples": [wandb.Image(image_grid, caption=f"Step {global_step}")],
+                    }, step=global_step)
                 
                 # Run evaluation
                 if val_dataloader and global_step % args.eval_every == 0:
