@@ -1,6 +1,7 @@
 # DiT with cross attention
 
 import math
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -12,13 +13,8 @@ from diffusers.utils.accelerate_utils import apply_forward_hook
 from einops import rearrange
 from peft import get_peft_model_state_dict, set_peft_model_state_dict
 from torch import nn
-
-
-def kaiming_init(m):
-    if isinstance(m, (nn.Linear, nn.Conv2d)):
-        nn.init.kaiming_normal_(m.weight)
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
+from liger_kernel.transformers import LigerRMSNorm, LigerSwiGLUMLP
+from flash_attn_interface import flash_attn_func
 
 
 def timestep_embedding(t, dim, max_period=10000):
@@ -97,7 +93,6 @@ class Attention(nn.Module):
             self.lambda_param = nn.Parameter(torch.tensor(0.5).reshape(1))
 
         self.qk_norm = QKNorm(self.head_dim)
-        self.apply(kaiming_init)
 
     def forward(self, x, context=None, v_0=None, rope=None):
         if self.is_self_attn:
@@ -124,19 +119,23 @@ class Attention(nn.Module):
                     k = k * ratio
             q, k = self.qk_norm(q, k)
 
+            q = rearrange(q, "b h l d -> b l h d")
+            k = rearrange(k, "b h l d -> b l h d")
+            v = rearrange(v, "b h l d -> b l h d")
         else:
-            q = rearrange(self.q(x), "b l (h d) -> b h l d", h=self.num_heads)
+            q = rearrange(self.q(x), "b l (h d) -> b l h d", h=self.num_heads)
             kv = rearrange(
                 self.context_kv(context),
-                "b l (k h d) -> k b h l d",
+                "b l (k h d) -> k b l h d",
                 k=2,
                 h=self.num_heads,
             )
             k, v = kv.unbind(0)
             q, k = self.qk_norm(q, k)
 
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b h l d -> b l (h d)")
+        # x = F.scaled_dot_product_attention(q, k, v)
+        x, _ = flash_attn_func(q, k, v, softmax_scale=self.scale)
+        x = rearrange(x, "b l h d -> b l (h d)")
         x = self.proj(x)
         return x, v if self.is_self_attn else None
 
@@ -151,10 +150,11 @@ class DiTBlock(nn.Module):
         qkv_bias=True,
         residual_v=False,
         dynamic_softmax_temperature=False,
+        shared_adaLN_modulation=None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.norm1 = RMSNorm(hidden_size, trainable=qkv_bias)
+        self.norm1 = LigerRMSNorm(hidden_size)
         self.self_attn = Attention(
             hidden_size,
             num_heads=num_heads,
@@ -165,7 +165,7 @@ class DiTBlock(nn.Module):
         )
 
         if cross_attn_input_size is not None:
-            self.norm2 = RMSNorm(hidden_size, trainable=qkv_bias)
+            self.norm2 = LigerRMSNorm(hidden_size)
             self.cross_attn = Attention(
                 hidden_size,
                 num_heads=num_heads,
@@ -178,19 +178,21 @@ class DiTBlock(nn.Module):
             self.norm2 = None
             self.cross_attn = None
 
-        self.norm3 = RMSNorm(hidden_size, trainable=qkv_bias)
+        self.norm3 = LigerRMSNorm(hidden_size)
         mlp_hidden = int(hidden_size * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden),
-            nn.GELU(),
-            nn.Linear(mlp_hidden, hidden_size),
+        mlp_config = SimpleNamespace(
+            hidden_size=hidden_size,
+            intermediate_size=mlp_hidden,
+            hidden_act="silu",
         )
+        self.mlp = LigerSwiGLUMLP(mlp_config)
 
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True))
-
-        self.apply(kaiming_init)
-        self.adaLN_modulation[-1].weight.data.zero_()
-        self.adaLN_modulation[-1].bias.data.zero_()
+        if shared_adaLN_modulation is not None:
+            self.adaLN_modulation = shared_adaLN_modulation
+        else:
+            self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True))
+            self.adaLN_modulation[-1].weight.data.zero_()
+            self.adaLN_modulation[-1].bias.data.zero_()
 
     # @torch.compile(mode='reduce-overhead')
     def forward(self, x, context, c, v_0=None, rope=None):
@@ -240,7 +242,6 @@ class PatchEmbed(nn.Module):
         super().__init__()
         self.patch_proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.patch_size = patch_size
-        self.apply(kaiming_init)
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -348,6 +349,10 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
             nn.Linear(4 * hidden_size, hidden_size),
         )
 
+        self.shared_adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True))
+        self.shared_adaLN_modulation[-1].weight.data.zero_()
+        self.shared_adaLN_modulation[-1].bias.data.zero_()
+
         self.blocks = nn.ModuleList(
             [
                 DiTBlock(
@@ -358,6 +363,7 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
                     residual_v=residual_v,
                     qkv_bias=train_bias_and_rms,
                     dynamic_softmax_temperature=dynamic_softmax_temperature,
+                    shared_adaLN_modulation=self.shared_adaLN_modulation,
                 )
                 for _ in range(depth)
             ]
