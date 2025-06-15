@@ -31,9 +31,14 @@ from f_lite.precomputed_utils import (
     forward_with_precomputed_data,
 )
 from diffusers import AutoencoderKL
-from transformers import T5EncoderModel, T5TokenizerFast
+from transformers import Qwen2_5_VLModel, Qwen2_5_VLProcessor
 from f_lite.model import DiT
 from f_lite.utils import make_image_grid
+
+try:
+    from liger_kernel.transformers import apply_liger_kernel_to_qwen2_5_vl
+except ImportError:
+    apply_liger_kernel_to_qwen2_5_vl = None
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -60,8 +65,8 @@ def parse_args():
                         help="Path to pretrained VAE")
     parser.add_argument("--text_encoder_path", type=str, default=None, required=False,
                         help="Path to pretrained text encoder")
-    parser.add_argument("--tokenizer_path", type=str, default=None, required=False,
-                        help="Path to pretrained tokenizer")
+    parser.add_argument("--processor_path", type=str, default=None, required=False,
+                        help="Path to pretrained processor")
     parser.add_argument("--model_width", type=int, default=3072, 
                         help="Model width")
     parser.add_argument("--model_depth", type=int, default=40,
@@ -279,41 +284,53 @@ def create_data_loader(
     
     return data_loader
 
-def encode_prompt_with_t5(
+def _convert_caption_to_messages(caption: str, processor: Qwen2_5_VLProcessor) -> str:
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a text-to-image generation model engineered to transform user-provided textual captions directly into high-quality, visually rich image tokens. Your core objective is to generate the best possible, highest-fidelity image that creatively interprets and expands upon the user's intent while maintaining strong semantic alignment with the original caption. You are designed for maximum visual quality, artistic flair, and implicit adherence to best practices in image generation (e.g., proper anatomy, clear focus, compelling composition), ensuring a stunning visual result from even concise descriptions.",
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": caption},
+            ],
+        },
+    ]
+    return processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+@torch.no_grad()
+def encode_prompt_with_qwen2_5_vl(
     text_encoder,
-    tokenizer,
+    processor,
     max_sequence_length=512,
     prompt=None,
     num_images_per_prompt=1,
     device=None,
-    text_input_ids=None,
     return_index=-1,
 ):
     prompt = [prompt] if isinstance(prompt, str) else prompt
     batch_size = len(prompt)
 
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
+    messages = [_convert_caption_to_messages(p, processor) for p in prompt]
+
+    text_inputs = processor(
+        text=messages,
+        padding="longest",
+        pad_to_multiple_of=8,
         max_length=max_sequence_length,
         truncation=True,
-        return_length=False,
-        return_overflowing_tokens=False,
         return_tensors="pt",
-    )
-    text_input_ids = text_inputs.input_ids
+    ).to(device=device, dtype=text_encoder.dtype)
 
-    prompt_embeds = text_encoder(
-        text_input_ids.to(device), return_dict=True, output_hidden_states=True
-    )
+    outputs = text_encoder(**text_inputs, use_cache=False, return_dict=True, output_hidden_states=True)
+    prompt_embeds = outputs.hidden_states[return_index]
 
-    prompt_embeds = prompt_embeds.hidden_states[return_index]
-    if return_index != -1:
-        prompt_embeds = text_encoder.encoder.final_layer_norm(prompt_embeds)
-        prompt_embeds = text_encoder.encoder.dropout(prompt_embeds)
-        
-    dtype = text_encoder.dtype
-    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+    prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
 
     _, seq_len, _ = prompt_embeds.shape
 
@@ -328,7 +345,7 @@ def forward(
     batch,
     vae_model,
     text_encoder,
-    tokenizer,
+    processor,
     device,
     global_step,
     master_process,
@@ -377,9 +394,9 @@ def forward(
         vae_latent = vae_latent.to(torch.bfloat16)
         
         # Encode captions
-        caption_encoded = encode_prompt_with_t5(
+        caption_encoded = encode_prompt_with_qwen2_5_vl(
             text_encoder,
-            tokenizer,
+            processor,
             prompt=captions,
             device=device,
             return_index=return_index,
@@ -474,7 +491,7 @@ def sample_images(
     dit_model,
     vae_model,
     text_encoder,
-    tokenizer,
+    processor,
     device,
     global_step,
     prompts=None,
@@ -519,9 +536,9 @@ def sample_images(
     with torch.no_grad():
         for i, prompt in enumerate(prompts):
             # Encode prompt
-            prompt_embeds = encode_prompt_with_t5(
+            prompt_embeds = encode_prompt_with_qwen2_5_vl(
                 text_encoder,
-                tokenizer,
+                processor,
                 prompt=[prompt],
                 device=device,
                 return_index=return_index,
@@ -651,8 +668,10 @@ def train(args):
         )
     else:
         vae = AutoencoderKL.from_pretrained(args.vae_path)
-        text_encoder = T5EncoderModel.from_pretrained(args.text_encoder_path)
-        tokenizer = T5TokenizerFast.from_pretrained(args.tokenizer_path)
+        text_encoder = Qwen2_5_VLModel.from_pretrained(args.text_encoder_path)
+        if apply_liger_kernel_to_qwen2_5_vl is not None:
+            apply_liger_kernel_to_qwen2_5_vl(text_encoder)
+        processor = Qwen2_5_VLProcessor.from_pretrained(args.processor_path)
         dit_model = DiT(
             in_channels=vae.config.latent_channels,
             patch_size=2,
@@ -660,8 +679,8 @@ def train(args):
             depth=args.model_depth,
             num_heads=args.model_width // args.model_head_dim,
             mlp_ratio=4.0,
-            cross_attn_input_size=text_encoder.config.d_model,
-            residual_v=False,
+            cross_attn_input_size=text_encoder.config.hidden_size,
+            residual_v=True,
             train_bias_and_rms=True,
             use_rope=True,
             gradient_checkpoint=False,
@@ -672,7 +691,7 @@ def train(args):
             dit_model=dit_model,
             vae=vae,
             text_encoder=text_encoder,
-            tokenizer=tokenizer)
+            processor=processor)
 
     # Load only the models needed based on precomputed status
     if args.use_precomputed_data:
@@ -684,7 +703,7 @@ def train(args):
         # Set VAE and text_encoder to None to save memory
         vae_model = None
         text_encoder = None
-        tokenizer = None
+        processor = None
 
         logger.info("Using precomputed data - VAE and text encoder not loaded to save memory")
     else:
@@ -692,12 +711,13 @@ def train(args):
         dit_model = pipeline.dit_model
         vae_model = pipeline.vae
         text_encoder = pipeline.text_encoder
-        tokenizer = pipeline.tokenizer
+        processor = pipeline.processor
 
         # Move models to device
         dit_model = dit_model.to(torch.bfloat16)
         dit_model = dit_model.to(device)
         vae_model = vae_model.to(device)
+        text_encoder = text_encoder.to(torch.bfloat16)
         text_encoder = text_encoder.to(device)
 
         # Freeze encoders (they are only used for inference)
@@ -973,7 +993,7 @@ def train(args):
                         batch=batch,
                         vae_model=vae_model,
                         text_encoder=text_encoder,
-                        tokenizer=tokenizer,
+                        processor=processor,
                         device=device,
                         global_step=global_step,
                         master_process=accelerator.is_main_process,
@@ -1113,7 +1133,7 @@ def train(args):
                             dit_model=accelerator.unwrap_model(dit_model),
                             vae_model=vae_model,
                             text_encoder=text_encoder,
-                            tokenizer=tokenizer,
+                            processor=processor,
                             device=device,
                             global_step=global_step,
                             prompts=None,  # Use default prompts as fallback
@@ -1145,7 +1165,7 @@ def train(args):
                                 batch=val_batch,
                                 vae_model=vae_model,
                                 text_encoder=text_encoder,
-                                tokenizer=tokenizer,
+                                processor=processor,
                                 device=device,
                                 global_step=global_step,
                                 master_process=accelerator.is_main_process,
