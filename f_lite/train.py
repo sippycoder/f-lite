@@ -680,7 +680,6 @@ def train(args):
             num_heads=args.model_width // args.model_head_dim,
             mlp_ratio=4.0,
             cross_attn_input_size=text_encoder.config.hidden_size,
-            residual_v=True,
             train_bias_and_rms=True,
             use_rope=True,
             gradient_checkpoint=False,
@@ -1022,7 +1021,7 @@ def train(args):
                 global_step += 1
                 
                 # Logging
-                if global_step % 10 == 0 and accelerator.is_main_process:
+                if global_step % 100 == 0 and accelerator.is_main_process:
                     logs = {
                         "train/loss": total_loss.item(),
                         "train/diffusion_loss": diffusion_loss.item(),
