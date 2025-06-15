@@ -69,7 +69,6 @@ class Attention(nn.Module):
         qkv_bias=False,
         is_self_attn=True,
         cross_attn_input_size=None,
-        residual_v=False,
         dynamic_softmax_temperature=False,
     ):
         super().__init__()
@@ -78,7 +77,6 @@ class Attention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
         self.is_self_attn = is_self_attn
-        self.residual_v = residual_v
         self.dynamic_softmax_temperature = dynamic_softmax_temperature
 
         if is_self_attn:
@@ -89,19 +87,13 @@ class Attention(nn.Module):
 
         self.proj = nn.Linear(dim, dim, bias=False)
 
-        if residual_v:
-            self.lambda_param = nn.Parameter(torch.tensor(0.5).reshape(1))
-
         self.qk_norm = QKNorm(self.head_dim)
 
-    def forward(self, x, context=None, v_0=None, rope=None):
+    def forward(self, x, context=None, rope=None):
         if self.is_self_attn:
             qkv = self.qkv(x)
             qkv = rearrange(qkv, "b l (k h d) -> k b h l d", k=3, h=self.num_heads)
             q, k, v = qkv.unbind(0)
-
-            if self.residual_v and v_0 is not None:
-                v = self.lambda_param * v + (1 - self.lambda_param) * v_0
 
             if rope is not None:
                 # print(q.shape, rope[0].shape, rope[1].shape)
@@ -137,7 +129,7 @@ class Attention(nn.Module):
         x, _ = flash_attn_func(q, k, v, softmax_scale=self.scale)
         x = rearrange(x, "b l h d -> b l (h d)")
         x = self.proj(x)
-        return x, v if self.is_self_attn else None
+        return x
 
 
 class DiTBlock(nn.Module):
@@ -148,7 +140,6 @@ class DiTBlock(nn.Module):
         num_heads,
         mlp_ratio=4.0,
         qkv_bias=True,
-        residual_v=False,
         dynamic_softmax_temperature=False,
         shared_adaLN_modulation=None,
     ):
@@ -160,7 +151,6 @@ class DiTBlock(nn.Module):
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             is_self_attn=True,
-            residual_v=residual_v,
             dynamic_softmax_temperature=dynamic_softmax_temperature,
         )
 
@@ -195,7 +185,7 @@ class DiTBlock(nn.Module):
             self.adaLN_modulation[-1].bias.data.zero_()
 
     # @torch.compile(mode='reduce-overhead')
-    def forward(self, x, context, c, v_0=None, rope=None):
+    def forward(self, x, context, c, rope=None):
         (
             shift_sa,
             scale_sa,
@@ -222,7 +212,7 @@ class DiTBlock(nn.Module):
 
         norm_x = self.norm1(x.clone())
         norm_x = norm_x * (1 + scale_sa) + shift_sa
-        attn_out, v = self.self_attn(norm_x, v_0=v_0, rope=rope)
+        attn_out = self.self_attn(norm_x, rope=rope)
         x = x + attn_out * gate_sa
 
         if self.norm2 is not None:
@@ -234,7 +224,7 @@ class DiTBlock(nn.Module):
         norm_x = norm_x * (1 + scale_mlp) + shift_mlp
         x = x + self.mlp(norm_x) * gate_mlp
 
-        return x, v
+        return x
 
 
 class PatchEmbed(nn.Module):
@@ -325,7 +315,6 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
         num_heads=16,
         mlp_ratio=4.0,
         cross_attn_input_size=128,
-        residual_v=False,
         train_bias_and_rms=True,
         use_rope=True,
         gradient_checkpoint=False,
@@ -360,7 +349,6 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     cross_attn_input_size=cross_attn_input_size,
-                    residual_v=residual_v,
                     qkv_bias=train_bias_and_rms,
                     dynamic_softmax_temperature=dynamic_softmax_temperature,
                     shared_adaLN_modulation=self.shared_adaLN_modulation,
@@ -414,23 +402,19 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
         t_emb = timestep_embedding(timesteps * 1000, self.config.hidden_size).to(x.device, dtype=x.dtype)
         t_emb = self.time_embed(t_emb)
 
-        v_0 = None
 
         for _idx, block in enumerate(self.blocks):
             if self.config.gradient_checkpoint:
-                x, v = torch.utils.checkpoint.checkpoint(
+                x = torch.utils.checkpoint.checkpoint(
                     block,
                     x,
                     context,
                     t_emb,
-                    v_0,
                     (cos, sin),
                     use_reentrant=False,
                 )
             else:
-                x, v = block(x, context, t_emb, v_0, (cos, sin))
-            if v_0 is None:
-                v_0 = v
+                x = block(x, context, t_emb, (cos, sin))
 
         x = x[:, 16:, :]
         final_shift, final_scale = self.final_modulation(t_emb).chunk(2, dim=1)
@@ -458,7 +442,6 @@ if __name__ == "__main__":
         num_heads=16,
         mlp_ratio=4.0,
         cross_attn_input_size=128,
-        residual_v=False,
         train_bias_and_rms=True,
         use_rope=True,
     ).cuda()
