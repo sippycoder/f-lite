@@ -303,14 +303,14 @@ def encode_prompt_with_t5(
     )
     text_input_ids = text_inputs.input_ids
 
-    text_output = text_encoder(
+    prompt_embeds = text_encoder(
         text_input_ids.to(device), return_dict=True, output_hidden_states=True
     )
 
-    if return_index == -1 or return_index == len(text_output.hidden_states) - 1:
-        prompt_embeds = text_output.last_hidden_state
-    else:
-        prompt_embeds = text_output.hidden_states[return_index]
+    prompt_embeds = prompt_embeds.hidden_states[return_index]
+    if return_index != -1:
+        prompt_embeds = text_encoder.encoder.final_layer_norm(prompt_embeds)
+        prompt_embeds = text_encoder.encoder.dropout(prompt_embeds)
         
     dtype = text_encoder.dtype
     prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
