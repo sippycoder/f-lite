@@ -11,6 +11,7 @@ import wandb
 import numpy as np
 import torch
 import torch.utils.checkpoint
+from torch.distributed._tensor import DTensor
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -311,7 +312,7 @@ def encode_prompt_with_qwen2_5_vl(
     prompt=None,
     num_images_per_prompt=1,
     device=None,
-    return_index=-1,
+    return_index=-8,
 ):
     prompt = [prompt] if isinstance(prompt, str) else prompt
     batch_size = len(prompt)
@@ -334,9 +335,10 @@ def encode_prompt_with_qwen2_5_vl(
 
     _, seq_len, _ = prompt_embeds.shape
 
-    # duplicate text embeddings and attention mask for each generation per prompt
-    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+    if num_images_per_prompt > 1:
+        # duplicate text embeddings and attention mask for each generation per prompt
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
     return prompt_embeds
 
@@ -354,7 +356,7 @@ def forward(
     batch_multiplicity=None,
     bs_rampup=None,
     batch_size=None,
-    return_index=-1,
+    return_index=-8,
 ):
     """
     Forward pass for DiT model.
@@ -554,7 +556,7 @@ def sample_images(
             latent_height = image_height // 8
             latent_width = image_width // 8
             latent_shape = (batch_size, vae_model.config.latent_channels, latent_height, latent_width)
-            latents = torch.randn(latent_shape, device=device, generator=generator, dtype=torch.float32)
+            latents = torch.randn(latent_shape, device=device, generator=generator, dtype=torch.bfloat16)
             
             # Setup timesteps with proper scaling
             image_token_size = latent_height * latent_width
@@ -682,7 +684,7 @@ def train(args):
             cross_attn_input_size=text_encoder.config.hidden_size,
             train_bias_and_rms=True,
             use_rope=True,
-            gradient_checkpoint=False,
+            gradient_checkpoint=args.gradient_checkpointing,
             dynamic_softmax_temperature=False,
             rope_base=args.rope_base,
         )
@@ -722,6 +724,9 @@ def train(args):
         # Freeze encoders (they are only used for inference)
         vae_model.requires_grad_(False)
         text_encoder.requires_grad_(False)
+
+        logger.info("Compiling VAE...")
+        vae_model = torch.compile(vae_model, mode='reduce-overhead')
     
     dit_model.train() 
     
@@ -1008,7 +1013,9 @@ def train(args):
                 
                 # Clip gradients
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(dit_model.parameters(), args.max_grad_norm)
+                    grad_norm = accelerator.clip_grad_norm_(dit_model.parameters(), args.max_grad_norm)
+                else:
+                    grad_norm = None
                 
                 # Update optimizer and scheduler
                 optimizer.step()
@@ -1021,7 +1028,7 @@ def train(args):
                 global_step += 1
                 
                 # Logging
-                if global_step % 100 == 0 and accelerator.is_main_process:
+                if global_step % 10 == 0 and accelerator.is_main_process:
                     logs = {
                         "train/loss": total_loss.item(),
                         "train/diffusion_loss": diffusion_loss.item(),
@@ -1029,6 +1036,11 @@ def train(args):
                         "train/epoch": epoch,
                         "train/step": global_step,
                     }
+
+                    if grad_norm is not None:
+                        logs["train/grad_norm"] = (
+                            grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else grad_norm
+                        ).item()
 
                     # Log average bin loss
                     for i in range(10):
