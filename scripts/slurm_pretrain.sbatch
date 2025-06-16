@@ -74,7 +74,7 @@ if [ -d "/opt/sagemaker_cluster" ]; then
     AUTO_RESUME="--auto-resume=1"
 fi
 
-ACCELERATE_CMD="accelerate launch --config_file default_config.yaml"
+ACCELERATE_CMD="accelerate launch --config_file fsdp2_config.yaml"
 
 # ACCELERATE_ARGS:
 # accelerate will use the PytorchMASTER_ADDR and PytorchMASTER_PORT for rendezvous.
@@ -89,7 +89,7 @@ declare -a TRAIN_SCRIPT_ARGS=(
     "f_lite.train"
 )
 
-BUCKET_NAME="train-bucket-8"
+BUCKET_NAME="train-bucket-1"
 
 declare -a TRAINING_ARGS=(
     "--vae_path" "/fsx/ubuntu/workspace/checkpoints/FLUX.1-dev/vae"
@@ -104,11 +104,11 @@ declare -a TRAINING_ARGS=(
     "--image_column" "media_path"
     "--caption_column" "captions"
     "--resolution" "256"
-    "--train_batch_size" "16"
+    "--train_batch_size" "128"
     "--num_epochs" "1"
-    "--max_steps" "2000000"
+    "--max_steps" "1000000"
     "--gradient_accumulation_step" "1"
-    "--learning_rate" "1e-4"
+    "--learning_rate" "2e-4"
     "--weight_decay" "0.01"
     "--lr_scheduler" "cosine"
     "--num_warmup_steps" "4000"
@@ -123,6 +123,7 @@ declare -a TRAINING_ARGS=(
     "--batch_multiplicity" "1"
     "--sample_every" "5000"
     "--sample_prompts_file" "prompts.txt"
+    "--gradient_checkpointing"
 )
 
 echo "--- srun command execution ---"
