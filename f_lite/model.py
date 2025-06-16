@@ -184,7 +184,7 @@ class DiTBlock(nn.Module):
             self.adaLN_modulation[-1].weight.data.zero_()
             self.adaLN_modulation[-1].bias.data.zero_()
 
-    # @torch.compile(mode='reduce-overhead')
+    @torch.compile(mode='reduce-overhead')
     def forward(self, x, context, c, rope=None):
         (
             shift_sa,
@@ -210,7 +210,7 @@ class DiTBlock(nn.Module):
         gate_ca = gate_ca[:, None, :]
         gate_mlp = gate_mlp[:, None, :]
 
-        norm_x = self.norm1(x.clone())
+        norm_x = self.norm1(x)
         norm_x = norm_x * (1 + scale_sa) + shift_sa
         attn_out = self.self_attn(norm_x, rope=rope)
         x = x + attn_out * gate_sa
@@ -218,7 +218,7 @@ class DiTBlock(nn.Module):
         if self.norm2 is not None:
             norm_x = self.norm2(x)
             norm_x = norm_x * (1 + scale_ca) + shift_ca
-            x = x + self.cross_attn(norm_x, context)[0] * gate_ca
+            x = x + self.cross_attn(norm_x, context) * gate_ca
 
         norm_x = self.norm3(x)
         norm_x = norm_x * (1 + scale_mlp) + shift_mlp
@@ -401,7 +401,6 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
 
         t_emb = timestep_embedding(timesteps * 1000, self.config.hidden_size).to(x.device, dtype=x.dtype)
         t_emb = self.time_embed(t_emb)
-
 
         for _idx, block in enumerate(self.blocks):
             if self.config.gradient_checkpoint:
