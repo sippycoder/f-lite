@@ -143,7 +143,7 @@ class BaseDataset(Dataset):
             for file in tqdm(parquet_files, desc=f"Loading data"):
                 df = pd.read_parquet(file)
                 df = df[df["media_source"] != "laion"]
-                data.extend(df.to_dict(orient="records"))
+                data.append(df)
                 
                 # Note: used for debugging
                 if self.debug and len(data) > 100000:
@@ -151,7 +151,7 @@ class BaseDataset(Dataset):
         else:
             raise ValueError(f"Invalid Root Directory Type. Set root_dir_type to 'json' or 'parquet'")
 
-        self.data = pd.DataFrame(data).reset_index()
+        self.data = pd.concat(data, ignore_index=True)
         end_time = time.time()  # Record the end time
         # Calculate the duration in seconds
         elapsed_time = end_time - start_time
