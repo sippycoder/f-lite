@@ -34,6 +34,7 @@ from f_lite.precomputed_utils import (
 from diffusers import AutoencoderKL
 from transformers import Qwen2_5_VLModel, Qwen2_5_VLProcessor
 from f_lite.model import DiT
+from f_lite.sampler import StatefulDistributedSampler
 from f_lite.utils import make_image_grid
 
 try:
@@ -240,6 +241,8 @@ def create_data_loader(
     center_crop=False,
     random_flip=False,
     use_resolution_buckets=True,
+    num_processes=1,
+    process_index=0,
 ):
     # Set seed for reproducibility if provided
     if seed is not None:
@@ -269,16 +272,14 @@ def create_data_loader(
         )
     else:
         # Standard approach
-        if shuffle:
-            sampler = torch.utils.data.RandomSampler(dataset)
-        else:
-            sampler = torch.utils.data.SequentialSampler(dataset)
+        sampler = StatefulDistributedSampler(dataset, batch_size=batch_size, num_replicas=num_processes, rank=process_index, shuffle=shuffle)
         
         data_loader = DataLoader(
             dataset,
             batch_size=batch_size,
             sampler=sampler,
             num_workers=num_workers,
+            prefetch_factor=2,
             pin_memory=True,
             drop_last=True,
         )
@@ -816,6 +817,8 @@ def train(args):
             center_crop=args.center_crop,
             random_flip=args.random_flip,
             use_resolution_buckets=args.use_resolution_buckets,
+            num_processes=accelerator.num_processes,
+            process_index=accelerator.process_index,
         )
 
         val_dataloader = None
@@ -826,6 +829,8 @@ def train(args):
                 base_image_dir=args.base_image_dir,
                 shuffle=False,
                 num_workers=4,
+                num_processes=accelerator.num_processes,
+                process_index=accelerator.process_index,
             )
     
     # Initialize optimizer
@@ -872,8 +877,8 @@ def train(args):
         )
     
     # Prepare with accelerator
-    dit_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        dit_model, optimizer, train_dataloader, lr_scheduler
+    dit_model, optimizer, lr_scheduler = accelerator.prepare(
+        dit_model, optimizer, lr_scheduler
     )
 
     if args.use_lora: 
@@ -903,7 +908,7 @@ def train(args):
         if checkpoint_path:
             logger.info(f"Resuming from checkpoint: {checkpoint_path}")
     
-            if os.path.isdir(checkpoint_path) and not os.path.exists(os.path.join(checkpoint_path, "optimizer.pt")):
+            if os.path.isdir(checkpoint_path) and not os.path.exists(os.path.join(checkpoint_path, "optimizer.bin")):
                 # This handles loading just the model weights without optimizer state
                 pipeline = FLitePipeline.from_pretrained(
                     checkpoint_path,
@@ -918,33 +923,34 @@ def train(args):
                     lora_state_dict = torch.load(os.path.join(checkpoint_path, "lora_weights.pt"), map_location=device)
                     set_peft_model_state_dict(dit_model, lora_state_dict)
     
-                dit_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                    dit_model, optimizer, train_dataloader, lr_scheduler
+                dit_model, optimizer, lr_scheduler = accelerator.prepare(
+                    dit_model, optimizer, lr_scheduler
                 )
                 
                 # Extract step number from checkpoint path
                 global_step = int(checkpoint_path.split("-")[-1])
-                resume_step = global_step
             else:
                 # This uses accelerator's state loading which includes optimizer state
                 accelerator.load_state(checkpoint_path)
                 
                 # Extract step number from checkpoint path
                 global_step = int(checkpoint_path.split("-")[-1])
-                resume_step = global_step
+            
+            # Load the sampler state
+            sampler_state = torch.load(os.path.join(checkpoint_path, "sampler_state.bin"))
+            train_dataloader.sampler.load_state_dict(sampler_state)
+            logger.info(f"Sampler state loaded from {os.path.join(checkpoint_path, 'sampler_state.bin')}")
         else:
             logger.info("No checkpoint found, starting from scratch")
             global_step = 0
-            resume_step = 0
     else:
         logger.info("No checkpoint specified, starting from scratch")
         global_step = 0
-        resume_step = 0
-
     
     # Initialize training progress bar
     progress_bar = tqdm(
-        range(global_step, max_steps),
+        total=max_steps,
+        initial=global_step,
         disable=not accelerator.is_main_process,
         desc="Training",
     )
@@ -970,13 +976,7 @@ def train(args):
         # Track time
         epoch_start_time = time.time()
         
-        for step, batch in enumerate(train_dataloader):
-            # Skip steps when resuming from checkpoint
-            if resume_step > 0 and global_step < resume_step:
-                global_step += 1
-                progress_bar.update(1)
-                continue
-            
+        for step, batch in enumerate(train_dataloader):    
             with accelerator.accumulate(dit_model):
                 # Forward pass
                 if args.use_precomputed_data:
@@ -1085,6 +1085,9 @@ def train(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved checkpoint to {save_path}")
+                        sampler_state = train_dataloader.sampler.state_dict(global_step)
+                        torch.save(sampler_state, os.path.join(save_path, "sampler_state.bin"))
+                        logger.info(f"Saved sampler state to {os.path.join(save_path, 'sampler_state.bin')}")
 
                         # Remove old checkpoints
                         if args.checkpoints_total_limit is not None:
@@ -1223,9 +1226,8 @@ def train(args):
             save_path = os.path.join(args.output_dir, f"epoch-{epoch+1}")
             os.makedirs(save_path, exist_ok=True)
             
-            unwrapped_model = accelerator.unwrap_model(dit_model)
-            torch.save(unwrapped_model.state_dict(), os.path.join(save_path, "model.pt"))
-            logger.info(f"Saved model for epoch {epoch+1} to {save_path}")
+            accelerator.save_state(save_path)
+            logger.info(f"Saved checkpoint to {save_path}")
         
         # Check if we've reached max steps
         if global_step >= max_steps:
