@@ -5,6 +5,7 @@ downcast_bf16: false
 enable_cpu_affinity: false
 fsdp_config:
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_sharding_strategy: HYBRID_SHARD
   fsdp_backward_prefetch_policy: BACKWARD_PRE
   fsdp_cpu_ram_efficient_loading: true
   fsdp_forward_prefetch: false
