@@ -164,7 +164,7 @@ class BaseDataset(Dataset):
         )
 
     def __len__(self) -> int:
-        return len(self.data)
+        return len(self.data) // 2048 * 2048
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         return self.data[idx]
