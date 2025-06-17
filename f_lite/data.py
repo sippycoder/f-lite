@@ -137,16 +137,18 @@ class BaseDataset(Dataset):
         start_time = time.time()  # Record the start time
         
         data = []
+        data_size = 0
         if self.root_dir_type == "parquet":
-            logging.info(f"Loading data from local parquet files: {self.root_dir}")
+            logging.info(f"Loading data from local parquet files: {self.root_dir}, debug: {self.debug}")
             parquet_files = glob.glob(os.path.join(self.root_dir, self.collection_name, "*/*/*.parquet"))
             for file in tqdm(parquet_files, desc=f"Loading data"):
                 df = pd.read_parquet(file)
                 df = df[df["media_source"] != "laion"]
+                data_size += len(df)
                 data.append(df)
                 
                 # Note: used for debugging
-                if self.debug and len(data) > 100000:
+                if self.debug and data_size > 10240:
                     break
         else:
             raise ValueError(f"Invalid Root Directory Type. Set root_dir_type to 'json' or 'parquet'")
