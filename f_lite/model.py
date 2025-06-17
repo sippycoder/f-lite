@@ -141,7 +141,6 @@ class DiTBlock(nn.Module):
         mlp_ratio=4.0,
         qkv_bias=True,
         dynamic_softmax_temperature=False,
-        shared_adaLN_modulation=None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -177,15 +176,8 @@ class DiTBlock(nn.Module):
         )
         self.mlp = LigerSwiGLUMLP(mlp_config)
 
-        if shared_adaLN_modulation is not None:
-            self.adaLN_modulation = shared_adaLN_modulation
-        else:
-            self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True))
-            self.adaLN_modulation[-1].weight.data.zero_()
-            self.adaLN_modulation[-1].bias.data.zero_()
-
-    @torch.compile(mode='reduce-overhead')
-    def forward(self, x, context, c, rope=None):
+    # @torch.compile(mode='reduce-overhead')
+    def forward(self, x, context, modulation, rope=None):
         (
             shift_sa,
             scale_sa,
@@ -196,7 +188,7 @@ class DiTBlock(nn.Module):
             shift_mlp,
             scale_mlp,
             gate_mlp,
-        ) = self.adaLN_modulation(c).chunk(9, dim=1)
+        ) = modulation
 
         scale_sa = scale_sa[:, None, :]
         scale_ca = scale_ca[:, None, :]
@@ -338,9 +330,9 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
             nn.Linear(4 * hidden_size, hidden_size),
         )
 
-        self.shared_adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True))
-        self.shared_adaLN_modulation[-1].weight.data.zero_()
-        self.shared_adaLN_modulation[-1].bias.data.zero_()
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True))
+        self.adaLN_modulation[-1].weight.data.zero_()
+        self.adaLN_modulation[-1].bias.data.zero_()
 
         self.blocks = nn.ModuleList(
             [
@@ -348,12 +340,11 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
                     hidden_size=hidden_size,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
-                    cross_attn_input_size=cross_attn_input_size,
+                    cross_attn_input_size=cross_attn_input_size if (idx % 4 == 0 or idx < 8) else None,
                     qkv_bias=train_bias_and_rms,
                     dynamic_softmax_temperature=dynamic_softmax_temperature,
-                    shared_adaLN_modulation=self.shared_adaLN_modulation,
                 )
-                for _ in range(depth)
+                for idx in range(depth)
             ]
         )
 
@@ -401,6 +392,7 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
 
         t_emb = timestep_embedding(timesteps * 1000, self.config.hidden_size).to(x.device, dtype=x.dtype)
         t_emb = self.time_embed(t_emb)
+        modulation = self.adaLN_modulation(t_emb).chunk(9, dim=1)
 
         for _idx, block in enumerate(self.blocks):
             if self.config.gradient_checkpoint:
@@ -408,12 +400,12 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
                     block,
                     x,
                     context,
-                    t_emb,
+                    modulation,
                     (cos, sin),
                     use_reentrant=False,
                 )
             else:
-                x = block(x, context, t_emb, (cos, sin))
+                x = block(x, context, modulation, (cos, sin))
 
         x = x[:, 16:, :]
         final_shift, final_scale = self.final_modulation(t_emb).chunk(2, dim=1)
