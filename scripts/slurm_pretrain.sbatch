@@ -116,7 +116,7 @@ declare -a TRAINING_ARGS=(
     "--lr_scheduler" "wsd"
     "--num_warmup_steps" "4000"
     "--seed" "47"
-    "--output_dir" "/fsx/checkpoints/f_lite/${BUCKET_NAME}"
+    "--output_dir" "/fsx/checkpoints/f_lite/flash_attn_${BUCKET_NAME}"
     "--checkpointing_steps" "5000"
     "--resume_from_checkpoint" "latest"
     "--mixed_precision" "bf16"
