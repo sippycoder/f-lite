@@ -14,7 +14,7 @@ from einops import rearrange
 from peft import get_peft_model_state_dict, set_peft_model_state_dict
 from torch import nn
 from liger_kernel.transformers import LigerRMSNorm, LigerSwiGLUMLP
-from flash_attn_interface import flash_attn_func
+from flash_attn_interface import flash_attn_varlen_func
 
 
 def timestep_embedding(t, dim, max_period=10000):
@@ -26,6 +26,67 @@ def timestep_embedding(t, dim, max_period=10000):
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
     return embedding
+
+
+def prepare_flash_attention_inputs(hidden_states, attention_mask=None):
+    """
+    Prepares inputs for flash_attn_varlen_func by flattening and calculating cu_seqlens.
+
+    Args:
+        hidden_states: Tensor of shape (batch_size, max_seqlen, embed_dim)
+        attention_mask: Tensor of shape (batch_size, max_seqlen) (0 for padding, 1 for actual token)
+
+    Returns:
+        flattened_hidden_states: Tensor of shape (total_num_tokens, embed_dim)
+        cu_seqlens: Tensor of shape (batch_size + 1,)
+        max_seqlen_in_batch: Max sequence length in the current batch
+        indices: Indices to re-construct the original padded tensor (for unflattening)
+    """
+    batch_size, max_seqlen_in_batch, embed_dim = hidden_states.shape
+    if attention_mask is None:
+        attention_mask = torch.ones((batch_size, max_seqlen_in_batch), device=hidden_states.device)
+
+    # Calculate actual sequence lengths from the attention mask
+    sequence_lengths = attention_mask.sum(dim=-1, dtype=torch.int32)
+
+    # Create cumulative sequence lengths
+    cu_seqlens = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device=hidden_states.device),
+        sequence_lengths.cumsum(dim=0, dtype=torch.int32)
+    ])
+
+    # Flatten hidden_states to (total_num_tokens, embed_dim)
+    # This removes padding tokens
+    # Using torch.nonzero and index_select is correct for this.
+    indices = torch.nonzero(attention_mask.view(-1), as_tuple=True)[0]
+    flattened_hidden_states = torch.index_select(hidden_states.view(-1, embed_dim), 0, indices)
+
+    return flattened_hidden_states, cu_seqlens, max_seqlen_in_batch, indices
+
+
+def unprepare_flash_attention_outputs(output_flat, indices, batch_size, max_seqlen, hidden_size):
+    """
+    Reconstructs the padded output tensor from the flattened output.
+
+    Args:
+        output_flat: Tensor of shape (total_num_tokens, embed_dim)
+        indices: Indices used during flattening to reconstruct the original shape
+        batch_size: Original batch size
+        max_seqlen: Original maximum sequence length
+        embed_dim: Original embedding dimension
+        dtype: Desired output data type
+        device: Desired output device
+    Returns:
+        padded_output: Tensor of shape (batch_size, max_seqlen, embed_dim)
+    """
+    output = torch.zeros(
+        (batch_size * max_seqlen, hidden_size),
+        dtype=output_flat.dtype,
+        device=output_flat.device
+    )
+    output.index_copy_(0, indices, output_flat) # output_flat should already be (total_tokens, embed_dim)
+    output = output.view(batch_size, max_seqlen, hidden_size)
+    return output
 
 
 class RMSNorm(nn.Module):
@@ -68,7 +129,6 @@ class Attention(nn.Module):
         num_heads=8,
         qkv_bias=False,
         is_self_attn=True,
-        cross_attn_input_size=None,
         dynamic_softmax_temperature=False,
     ):
         super().__init__()
@@ -83,16 +143,16 @@ class Attention(nn.Module):
             self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         else:
             self.q = nn.Linear(dim, dim, bias=qkv_bias)
-            self.context_kv = nn.Linear(cross_attn_input_size, dim * 2, bias=qkv_bias)
+            self.context_kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
 
         self.proj = nn.Linear(dim, dim, bias=False)
 
         self.qk_norm = QKNorm(self.head_dim)
 
-    def forward(self, x, context=None, context_attn_mask=None, rope=None):
+    def forward(self, x, x_cu_seqlens, x_max_seqlen_in_batch, context=None, context_cu_seqlens=None, context_max_seqlen_in_batch=None, rope=None):
         if self.is_self_attn:
             qkv = self.qkv(x)
-            qkv = rearrange(qkv, "b l (k h d) -> k b h l d", k=3, h=self.num_heads)
+            qkv = rearrange(qkv, "l (k h d) -> k h l d", k=3, h=self.num_heads)
             q, k, v = qkv.unbind(0)
 
             if rope is not None:
@@ -110,24 +170,37 @@ class Attention(nn.Module):
                     ratio = math.sqrt(math.log(token_length) / math.log(1040.0))  # 1024 + 16
                     k = k * ratio
             q, k = self.qk_norm(q, k)
-
-            q = rearrange(q, "b h l d -> b l h d")
-            k = rearrange(k, "b h l d -> b l h d")
-            v = rearrange(v, "b h l d -> b l h d")
+            q = rearrange(q, "h l d -> l h d")
+            k = rearrange(k, "h l d -> l h d")
+            v = rearrange(v, "h l d -> l h d")
+            cu_seqlens_q = x_cu_seqlens
+            cu_seqlens_k = x_cu_seqlens
+            max_seqlen_q = x_max_seqlen_in_batch
+            max_seqlen_k = x_max_seqlen_in_batch
         else:
-            q = rearrange(self.q(x), "b l (h d) -> b l h d", h=self.num_heads)
+            q = rearrange(self.q(x), "l (h d) -> l h d", h=self.num_heads)
             kv = rearrange(
                 self.context_kv(context),
-                "b l (k h d) -> k b l h d",
+                "l (k h d) -> k l h d",
                 k=2,
                 h=self.num_heads,
             )
             k, v = kv.unbind(0)
             q, k = self.qk_norm(q, k)
+            cu_seqlens_q = x_cu_seqlens
+            cu_seqlens_k = context_cu_seqlens
+            max_seqlen_q = x_max_seqlen_in_batch
+            max_seqlen_k = context_max_seqlen_in_batch
 
-        # x = F.scaled_dot_product_attention(q, k, v)
-        x, _ = flash_attn_func(q, k, v, softmax_scale=self.scale)
-        x = rearrange(x, "b l h d -> b l (h d)")
+        x, _ = flash_attn_varlen_func(
+            q, k, v, 
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.scale
+        )
+        x = rearrange(x, "l h d -> l (h d)")
         x = self.proj(x)
         return x
 
@@ -136,8 +209,8 @@ class DiTBlock(nn.Module):
     def __init__(
         self,
         hidden_size,
-        cross_attn_input_size,
         num_heads,
+        do_cross_attn=False,
         mlp_ratio=4.0,
         qkv_bias=True,
         dynamic_softmax_temperature=False,
@@ -153,14 +226,13 @@ class DiTBlock(nn.Module):
             dynamic_softmax_temperature=dynamic_softmax_temperature,
         )
 
-        if cross_attn_input_size is not None:
+        if do_cross_attn:
             self.norm2 = LigerRMSNorm(hidden_size)
             self.cross_attn = Attention(
                 hidden_size,
                 num_heads=num_heads,
                 qkv_bias=qkv_bias,
                 is_self_attn=False,
-                cross_attn_input_size=cross_attn_input_size,
                 dynamic_softmax_temperature=dynamic_softmax_temperature,
             )
         else:
@@ -177,7 +249,7 @@ class DiTBlock(nn.Module):
         self.mlp = LigerSwiGLUMLP(mlp_config)
 
     # @torch.compile(mode='reduce-overhead')
-    def forward(self, x, context, modulation, rope=None):
+    def forward(self, x, x_cu_seqlens, x_max_seqlen_in_batch, context, context_cu_seqlens, context_max_seqlen_in_batch, modulation, rope=None):
         (
             shift_sa,
             scale_sa,
@@ -190,27 +262,21 @@ class DiTBlock(nn.Module):
             gate_mlp,
         ) = modulation
 
-        scale_sa = scale_sa[:, None, :]
-        scale_ca = scale_ca[:, None, :]
-        scale_mlp = scale_mlp[:, None, :]
-
-        shift_sa = shift_sa[:, None, :]
-        shift_ca = shift_ca[:, None, :]
-        shift_mlp = shift_mlp[:, None, :]
-
-        gate_sa = gate_sa[:, None, :]
-        gate_ca = gate_ca[:, None, :]
-        gate_mlp = gate_mlp[:, None, :]
-
         norm_x = self.norm1(x)
         norm_x = norm_x * (1 + scale_sa) + shift_sa
-        attn_out = self.self_attn(norm_x, rope=rope)
+        attn_out = self.self_attn(
+            norm_x, x_cu_seqlens, x_max_seqlen_in_batch, 
+            rope=rope
+        )
         x = x + attn_out * gate_sa
 
         if self.norm2 is not None:
             norm_x = self.norm2(x)
             norm_x = norm_x * (1 + scale_ca) + shift_ca
-            x = x + self.cross_attn(norm_x, context) * gate_ca
+            x = x + self.cross_attn(
+                norm_x, x_cu_seqlens, x_max_seqlen_in_batch, 
+                context, context_cu_seqlens, context_max_seqlen_in_batch
+            ) * gate_ca
 
         norm_x = self.norm3(x)
         norm_x = norm_x * (1 + scale_mlp) + shift_mlp
@@ -281,19 +347,19 @@ class TwoDimRotary(torch.nn.Module):
                 0,
             )
 
-        return cos[None, None, :, :], sin[None, None, :, :]  # [1, 1, T + N, Attn-dim]
+        return cos[None, :, :], sin[None, :, :]  # [1, T + N, Attn-dim]
 
 
 def apply_rotary_emb(x, cos, sin):
     orig_dtype = x.dtype
     x = x.to(dtype=torch.float32)
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
+    assert x.ndim == 3  # multihead attention
+    d = x.shape[2] // 2
     x1 = x[..., :d]
     x2 = x[..., d:]
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3).to(dtype=orig_dtype)
+    return torch.cat([y1, y2], 2).to(dtype=orig_dtype)
 
 
 class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  # type: ignore[misc]
@@ -315,7 +381,8 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
     ):
         super().__init__()
 
-        self.context_norm = LigerRMSNorm(cross_attn_input_size)
+        self.context_proj = nn.Linear(cross_attn_input_size, hidden_size)
+        self.context_norm = LigerRMSNorm(hidden_size)
 
         self.patch_embed = PatchEmbed(patch_size, in_channels, hidden_size)
 
@@ -342,7 +409,7 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
                     hidden_size=hidden_size,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
-                    cross_attn_input_size=cross_attn_input_size if (idx % 4 == 0 or idx < 8) else None,
+                    do_cross_attn=(idx % 4 == 0 or idx < 8),     # cross attn every 4 blocks or first 8 blocks
                     qkv_bias=train_bias_and_rms,
                     dynamic_softmax_temperature=dynamic_softmax_temperature,
                 )
@@ -377,8 +444,11 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
 
     @apply_forward_hook
     def forward(self, x, context, context_attn_mask, timesteps):
+        context = self.context_proj(context)
         context = self.context_norm(context)
         
+        context_flat, context_cu_seqlens, context_max_seqlen_in_batch, context_indices = prepare_flash_attention_inputs(context, context_attn_mask)
+
         b, c, h, w = x.shape
         x = self.patch_embed(x)  # b, T, d
 
@@ -390,26 +460,39 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
                 extend_with_register_tokens=16,
                 height_width=(h // self.config.patch_size, w // self.config.patch_size),
             )
+            cos = cos.repeat(1, b, 1)
+            sin = sin.repeat(1, b, 1)
         else:
             x = x + self.positional_embedding.repeat(b, 1, 1)[:, : x.shape[1], :]
             cos, sin = None, None
 
+        x_flat, x_cu_seqlens, x_max_seqlen_in_batch, x_indices = prepare_flash_attention_inputs(x)
+
         t_emb = timestep_embedding(timesteps * 1000, self.config.hidden_size).to(x.device, dtype=x.dtype)
         t_emb = self.time_embed(t_emb)
-        modulation = self.adaLN_modulation(t_emb).chunk(9, dim=1)
+        modulation = self.adaLN_modulation(t_emb).repeat_interleave(
+            16 + h // self.config.patch_size * w // self.config.patch_size, 
+            dim=0
+        ).chunk(9, dim=1)
 
         for _idx, block in enumerate(self.blocks):
             if self.config.gradient_checkpoint:
-                x = torch.utils.checkpoint.checkpoint(
+                x_flat = torch.utils.checkpoint.checkpoint(
                     block,
-                    x,
-                    context,
+                    x_flat, x_cu_seqlens, x_max_seqlen_in_batch,
+                    context_flat, context_cu_seqlens, context_max_seqlen_in_batch,
                     modulation,
                     (cos, sin),
                     use_reentrant=False,
                 )
             else:
-                x = block(x, context, modulation, (cos, sin))
+                x_flat = block(
+                    x_flat, x_cu_seqlens, x_max_seqlen_in_batch, 
+                    context_flat, context_cu_seqlens, context_max_seqlen_in_batch, 
+                    modulation, (cos, sin)
+                )
+
+        x = unprepare_flash_attention_outputs(x_flat, x_indices, b, x_max_seqlen_in_batch, self.config.hidden_size)
 
         x = x[:, 16:, :]
         final_shift, final_scale = self.final_modulation(t_emb).chunk(2, dim=1)
