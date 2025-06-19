@@ -549,7 +549,9 @@ def sample_images(
                 prompt=[prompt],
                 device=device,
                 return_index=return_index,
-            ).to(torch.bfloat16)
+            )
+            prompt_embeds = prompt_embeds.to(torch.bfloat16)
+            prompt_attn_mask = prompt_attn_mask.to(torch.bfloat16)
             
             # Create unconditional embeddings for CFG
             negative_embeds = torch.zeros_like(prompt_embeds)
