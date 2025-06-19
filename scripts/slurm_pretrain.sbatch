@@ -54,8 +54,8 @@ echo "PYTHONPATH: $PYTHONPATH"
 
 # --- PyTorch distributed setup ---
 # Determine Master Address and Port from Slurm
-export PytorchMASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-export PytorchMASTER_PORT=29500 # Default port
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=29500 # Default port
 
 echo "--- Slurm Job Information ---"
 echo "SLURM_JOB_ID: ${SLURM_JOB_ID}"
@@ -63,8 +63,8 @@ echo "SLURM_JOB_NODELIST: ${SLURM_JOB_NODELIST}"
 echo "SLURM_NNODES: ${SLURM_NNODES}"
 echo "SLURM_NTASKS_PER_NODE: ${SLURM_NTASKS_PER_NODE}"
 echo "SLURM_SUBMIT_DIR: ${SLURM_SUBMIT_DIR}"
-echo "PytorchMASTER_ADDR: ${PytorchMASTER_ADDR}"
-echo "PytorchMASTER_PORT: ${PytorchMASTER_PORT}"
+echo "MASTER_ADDR: ${MASTER_ADDR}"
+echo "MASTER_PORT: ${MASTER_PORT}"
 echo "--- End Slurm Job Information ---"
 
 
@@ -77,10 +77,13 @@ fi
 ACCELERATE_CMD="accelerate launch --config_file fsdp2_config.yaml"
 
 # ACCELERATE_ARGS:
-# accelerate will use the PytorchMASTER_ADDR and PytorchMASTER_PORT for rendezvous.
+# accelerate will use the MASTER_ADDR and MASTER_PORT for rendezvous.
 # nnodes and node_rank are typically auto-detected by accelerate from Slurm environment variables.
 declare -a ACCELERATE_ARGS=(
     "--log_dir=${LOG_DIR}/job_${SLURM_JOB_ID}_node_${SLURM_NODEID}" # Per-node accelerate logs
+    "--num_machines=${SLURM_NNODES}"
+    "--main_process_ip=${MASTER_ADDR}"
+    "--main_process_port=${MASTER_PORT}"
 )
 
 # Training script module and its arguments
@@ -104,13 +107,13 @@ declare -a TRAINING_ARGS=(
     "--image_column" "media_path"
     "--caption_column" "captions"
     "--resolution" "256"
-    "--train_batch_size" "128"
+    "--train_batch_size" "16"
     "--num_epochs" "1"
     "--max_steps" "1000000"
     "--gradient_accumulation_step" "1"
     "--learning_rate" "2e-4"
     "--weight_decay" "0.01"
-    "--lr_scheduler" "cosine"
+    "--lr_scheduler" "wsd"
     "--num_warmup_steps" "4000"
     "--seed" "47"
     "--output_dir" "/fsx/checkpoints/f_lite/${BUCKET_NAME}"
@@ -123,7 +126,6 @@ declare -a TRAINING_ARGS=(
     "--batch_multiplicity" "1"
     "--sample_every" "5000"
     "--sample_prompts_file" "prompts.txt"
-    "--gradient_checkpointing"
 )
 
 echo "--- srun command execution ---"
@@ -142,7 +144,7 @@ echo "TRAIN_SCRIPT_ARGS: ${TRAIN_SCRIPT_ARGS[*]}"
 echo "TRAINING_ARGS: ${TRAINING_ARGS[*]}"
 
 # Ensure all necessary variables are exported for srun tasks
-export PATH FI_PROVIDER FI_EFA_USE_DEVICE_RDMA FI_EFA_USE_HUGE_PAGE FI_EFA_SET_CUDA_SYNC_MEMOPS NCCL_PROTO NCCL_SOCKET_IFNAME LD_PRELOAD
+export PATH FI_PROVIDER FI_EFA_USE_DEVICE_RDMA FI_EFA_USE_HUGE_PAGE FI_EFA_SET_CUDA_SYNC_MEMOPS NCCL_PROTO NCCL_SOCKET_IFNAME LD_PRELOAD MASTER_ADDR MASTER_PORT
 
 srun ${AUTO_RESUME} \
     ${ACCELERATE_CMD} \
