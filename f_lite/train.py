@@ -115,7 +115,7 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.01,
                         help="Weight decay coefficient")
     parser.add_argument("--lr_scheduler", type=str, default="linear",
-                        choices=["linear", "cosine", "constant"],
+                        choices=["linear", "cosine", "wsd", "constant"],
                         help="Learning rate scheduler type")
     parser.add_argument("--num_warmup_steps", type=int, default=0,
                         help="Number of warmup steps for learning rate scheduler")
@@ -321,18 +321,19 @@ def encode_prompt_with_qwen2_5_vl(
 
     messages = [_convert_caption_to_messages(p, processor) for p in prompt]
 
-    text_inputs = processor(
+    inputs = processor(
         text=messages,
         padding="longest",
         pad_to_multiple_of=8,
         max_length=max_sequence_length,
         truncation=True,
+        return_attention_mask=True,
         return_tensors="pt",
     ).to(device=device, dtype=text_encoder.dtype)
+    attn_mask = inputs.attention_mask
 
-    outputs = text_encoder(**text_inputs, use_cache=False, return_dict=True, output_hidden_states=True)
+    outputs = text_encoder(**inputs, use_cache=False, return_dict=True, output_hidden_states=True)
     prompt_embeds = outputs.hidden_states[return_index]
-    attn_mask = outputs.attention_mask
 
     prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
 
@@ -879,7 +880,6 @@ def train(args):
             num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
             num_decay_steps=max_steps // 10 * accelerator.num_processes,  # 10% of the training steps for decay
             num_stable_steps=(max_steps - args.num_warmup_steps - max_steps // 10) * accelerator.num_processes,  # 90% of the training steps for stable
-            num_training_steps=max_steps * accelerator.num_processes,
         )
     else:  # constant with warmup
         lr_scheduler = get_linear_schedule_with_warmup(
