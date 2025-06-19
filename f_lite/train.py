@@ -23,6 +23,7 @@ from tqdm.auto import tqdm
 from transformers import (
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
+    get_wsd_schedule
 )
 
 from f_lite.data import ImageDataset
@@ -331,6 +332,7 @@ def encode_prompt_with_qwen2_5_vl(
 
     outputs = text_encoder(**text_inputs, use_cache=False, return_dict=True, output_hidden_states=True)
     prompt_embeds = outputs.hidden_states[return_index]
+    attn_mask = outputs.attention_mask
 
     prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
 
@@ -341,7 +343,7 @@ def encode_prompt_with_qwen2_5_vl(
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
-    return prompt_embeds
+    return prompt_embeds, attn_mask
 
 def forward(
     dit_model,
@@ -397,7 +399,7 @@ def forward(
         vae_latent = vae_latent.to(torch.bfloat16)
         
         # Encode captions
-        caption_encoded = encode_prompt_with_qwen2_5_vl(
+        caption_encoded, caption_attn_mask = encode_prompt_with_qwen2_5_vl(
             text_encoder,
             processor,
             prompt=captions,
@@ -415,7 +417,8 @@ def forward(
     # Randomly zero out some caption_encoded (simulates classifier-free guidance)
     do_zero_out = torch.rand(caption_encoded.shape[0], device=device) < 0.1
     caption_encoded[do_zero_out] = 0
-    
+    caption_attn_mask[do_zero_out] = 1
+
     # Batch size rampup - gradually increase batch size during training
     if bs_rampup is not None and global_step < bs_rampup:
         target_bs = math.ceil((global_step + 1) * batch_size / bs_rampup / 4) * 4  # Round to multiple of 4
@@ -460,7 +463,7 @@ def forward(
     v_objective = vae_latent - noise
      
     # Forward through model
-    output = dit_model(z_t, caption_encoded, t)
+    output = dit_model(z_t, caption_encoded, caption_attn_mask, t)
     
     targ = rearrange(v_objective, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=2, p2=2)
     pred = rearrange(output, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=2, p2=2)
@@ -539,7 +542,7 @@ def sample_images(
     with torch.no_grad():
         for i, prompt in enumerate(prompts):
             # Encode prompt
-            prompt_embeds = encode_prompt_with_qwen2_5_vl(
+            prompt_embeds, prompt_attn_mask = encode_prompt_with_qwen2_5_vl(
                 text_encoder,
                 processor,
                 prompt=[prompt],
@@ -549,6 +552,7 @@ def sample_images(
             
             # Create unconditional embeddings for CFG
             negative_embeds = torch.zeros_like(prompt_embeds)
+            negative_attn_mask = torch.ones_like(prompt_attn_mask)
             
             # Initialize latents with correct channel count (16)
             batch_size = 1
@@ -577,11 +581,11 @@ def sample_images(
                 t_tensor = torch.tensor([t] * batch_size).to(device, torch.bfloat16)
                 
                 # Get model prediction
-                model_output = dit_model(latents.to(torch.bfloat16), prompt_embeds, t_tensor)
+                model_output = dit_model(latents.to(torch.bfloat16), prompt_embeds, prompt_attn_mask, t_tensor)
                 
                 # Apply classifier-free guidance
                 if cfg_scale > 1:
-                    uncond_output = dit_model(latents.to(torch.bfloat16), negative_embeds, t_tensor)
+                    uncond_output = dit_model(latents.to(torch.bfloat16), negative_embeds, negative_attn_mask, t_tensor)
                     model_output = uncond_output + cfg_scale * (model_output - uncond_output)
                 
                 # Update latents with simple velocity update
@@ -860,20 +864,28 @@ def train(args):
     if args.lr_scheduler == "cosine":
         lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=args.num_warmup_steps,
-            num_training_steps=max_steps,
+            num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
+            num_training_steps=max_steps * accelerator.num_processes,
         )
     elif args.lr_scheduler == "linear":
         lr_scheduler = get_linear_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=args.num_warmup_steps,
-            num_training_steps=max_steps,
+            num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
+            num_training_steps=max_steps * accelerator.num_processes,
+        )
+    elif args.lr_scheduler == "wsd":
+        lr_scheduler = get_wsd_schedule(
+            optimizer=optimizer,
+            num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
+            num_decay_steps=max_steps // 10 * accelerator.num_processes,  # 10% of the training steps for decay
+            num_stable_steps=(max_steps - args.num_warmup_steps - max_steps // 10) * accelerator.num_processes,  # 90% of the training steps for stable
+            num_training_steps=max_steps * accelerator.num_processes,
         )
     else:  # constant with warmup
         lr_scheduler = get_linear_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=args.num_warmup_steps,
-            num_training_steps=max_steps * 1000,  # Very long decay to simulate constant
+            num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
+            num_training_steps=max_steps * accelerator.num_processes * 1000,  # Very long decay to simulate constant
         )
     
     # Prepare with accelerator

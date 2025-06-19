@@ -89,7 +89,7 @@ class Attention(nn.Module):
 
         self.qk_norm = QKNorm(self.head_dim)
 
-    def forward(self, x, context=None, rope=None):
+    def forward(self, x, context=None, context_attn_mask=None, rope=None):
         if self.is_self_attn:
             qkv = self.qkv(x)
             qkv = rearrange(qkv, "b l (k h d) -> k b h l d", k=3, h=self.num_heads)
@@ -315,6 +315,8 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
     ):
         super().__init__()
 
+        self.context_norm = LigerRMSNorm(cross_attn_input_size)
+
         self.patch_embed = PatchEmbed(patch_size, in_channels, hidden_size)
 
         if use_rope:
@@ -374,7 +376,9 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
         set_peft_model_state_dict(self, lora_state_dict)
 
     @apply_forward_hook
-    def forward(self, x, context, timesteps):
+    def forward(self, x, context, context_attn_mask, timesteps):
+        context = self.context_norm(context)
+        
         b, c, h, w = x.shape
         x = self.patch_embed(x)  # b, T, d
 
