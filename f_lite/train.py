@@ -998,7 +998,7 @@ def train(args):
             global_step += 1
             
             # Logging
-            if global_step % 10 == 0 and is_main_process():
+            if global_step % 10 == 0:
                 logs = {
                     "train/loss": total_loss.item(),
                     "train/diffusion_loss": diffusion_loss.item(),
@@ -1022,7 +1022,7 @@ def train(args):
                         logs[f"metrics/avg_loss_bin_{i}"] = avg_bin_loss
                 
                 # Log bin counts as a histogram
-                if any(diffusion_loss_binning_count.values()):
+                if any(diffusion_loss_binning_count.values()) and is_main_process():
                     raw_data = []
                     for bin_idx, count in diffusion_loss_binning_count.items():
                         raw_data.extend([bin_idx] * int(count))
@@ -1038,7 +1038,8 @@ def train(args):
                 diffusion_loss_binning_count.update({k: 0 for k in range(10)})
                 
                 # Log to all trackers
-                wandb.log(logs, step=global_step)
+                if is_main_process():
+                    wandb.log(logs, step=global_step)
                 
                 # Update progress bar
                 progress_bar.set_postfix({
@@ -1049,9 +1050,9 @@ def train(args):
             
             # Save checkpoint
             if global_step % args.checkpointing_steps == 0:
+                checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
                 if is_main_process():
-                    checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
-                    logger.info(f"Saved checkpoint to {args.output_dir}/{global_step}")
+                    logger.info(f"Saved checkpoint to {args.output_dir}/dcp_api/{global_step}")
 
                     # Remove old checkpoints
                     if args.checkpoints_total_limit is not None:
@@ -1070,7 +1071,7 @@ def train(args):
                                 logger.info(f"Removed old checkpoint: {ckpt_to_delete}")
 
             # Sample images
-            if global_step % args.sample_every == 0 and is_main_process():
+            if global_step % args.sample_every == 0:
                 # For sampling, we need VAE and text encoder
                 temp_vae = None
                 temp_text_encoder = None
@@ -1122,9 +1123,10 @@ def train(args):
                     )
             
                 # Save image grid to wandb
-                wandb.log({
-                    "samples": [wandb.Image(image_grid, caption=f"Step {global_step}")],
-                }, step=global_step)
+                if is_main_process():
+                    wandb.log({
+                        "samples": [wandb.Image(image_grid, caption=f"Step {global_step}")],
+                    }, step=global_step)
             
             # Run evaluation
             if val_dataloader and global_step % args.eval_every == 0:
@@ -1186,9 +1188,9 @@ def train(args):
         logger.info(f"Epoch {epoch+1} completed in {epoch_time:.2f} seconds")
         
         # Save model at the end of each epoch
+        checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
         if is_main_process():
-            checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
-            logger.info(f"Saved checkpoint to {args.output_dir}/{global_step}")
+            logger.info(f"Saved checkpoint to {args.output_dir}/dcp_api/{global_step}")
         
         # Check if we've reached max steps
         if global_step >= max_steps:
@@ -1198,11 +1200,11 @@ def train(args):
     logger.info(f"Training completed after {global_step} steps!")
     
     # Save the final model
+    checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
     if is_main_process():
-        final_model_path = os.path.join(args.output_dir, "final_model")
+        final_model_path = os.path.join(args.output_dir, f"dcp_api/{global_step}")
         os.makedirs(final_model_path, exist_ok=True)
         
-        checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
         logger.info(f"Final model saved to {final_model_path}")
 
         # Save LoRA weights separately if using LoRA
