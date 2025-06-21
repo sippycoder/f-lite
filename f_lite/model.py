@@ -442,6 +442,113 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
         lora_state_dict = torch.load(f"{load_directory}/lora_weights.pt")
         set_peft_model_state_dict(self, lora_state_dict)
 
+    def reset_parameters(self):
+        """Reset all model parameters to their initial values"""
+        # Reset context projection and norm
+        if hasattr(self.context_proj, 'reset_parameters'):
+            self.context_proj.reset_parameters()
+        else:
+            nn.init.xavier_uniform_(self.context_proj.weight)
+            if self.context_proj.bias is not None:
+                nn.init.zeros_(self.context_proj.bias)
+        
+        # Reset patch embedding
+        if hasattr(self.patch_embed.patch_proj, 'reset_parameters'):
+            self.patch_embed.patch_proj.reset_parameters()
+        else:
+            nn.init.kaiming_normal_(self.patch_embed.patch_proj.weight, mode='fan_out', nonlinearity='relu')
+            if self.patch_embed.patch_proj.bias is not None:
+                nn.init.zeros_(self.patch_embed.patch_proj.bias)
+        
+        # Reset positional embedding or rope
+        if hasattr(self, 'positional_embedding'):
+            nn.init.zeros_(self.positional_embedding)
+        
+        # Reset register tokens
+        nn.init.normal_(self.register_tokens, std=0.02)
+        
+        # Reset time embedding layers
+        for module in self.time_embed:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        
+        # Reset adaLN modulation - keep the special initialization
+        for module in self.adaLN_modulation:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        # Apply the special zero initialization for the last layer
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        
+        # Reset all DiT blocks
+        for block in self.blocks:
+            self._reset_dit_block_parameters(block)
+        
+        # Reset final modulation - keep the special initialization
+        for module in self.final_modulation:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        # Apply the special zero initialization for the last layer
+        nn.init.zeros_(self.final_modulation[-1].weight)
+        nn.init.zeros_(self.final_modulation[-1].bias)
+        
+        # Reset final projection - keep the special initialization
+        nn.init.zeros_(self.final_proj.weight)
+        nn.init.zeros_(self.final_proj.bias)
+
+    def _reset_dit_block_parameters(self, block):
+        """Reset parameters for a single DiT block"""
+        # Reset self attention
+        self._reset_attention_parameters(block.self_attn)
+        
+        # Reset cross attention if it exists
+        if hasattr(block, 'cross_attn') and block.cross_attn is not None:
+            self._reset_attention_parameters(block.cross_attn)
+        
+        # Reset MLP - LigerSwiGLUMLP should handle its own reset if available
+        if hasattr(block.mlp, 'reset_parameters'):
+            block.mlp.reset_parameters()
+        else:
+            # Manual reset for MLP components if needed
+            for module in block.mlp.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+    def _reset_attention_parameters(self, attn_module):
+        """Reset parameters for an attention module"""
+        # Reset QKV or Q/KV projections
+        if hasattr(attn_module, 'qkv'):
+            nn.init.xavier_uniform_(attn_module.qkv.weight)
+            if attn_module.qkv.bias is not None:
+                nn.init.zeros_(attn_module.qkv.bias)
+        else:
+            # Cross attention case
+            nn.init.xavier_uniform_(attn_module.q.weight)
+            if attn_module.q.bias is not None:
+                nn.init.zeros_(attn_module.q.bias)
+            nn.init.xavier_uniform_(attn_module.context_kv.weight)
+            if attn_module.context_kv.bias is not None:
+                nn.init.zeros_(attn_module.context_kv.bias)
+        
+        # Reset output projection
+        nn.init.xavier_uniform_(attn_module.proj.weight)
+        if attn_module.proj.bias is not None:
+            nn.init.zeros_(attn_module.proj.bias)
+        
+        # Reset QK normalization parameters if they have trainable weights
+        if hasattr(attn_module.qk_norm.query_norm, 'weight') and attn_module.qk_norm.query_norm.weight is not None:
+            nn.init.ones_(attn_module.qk_norm.query_norm.weight)
+        if hasattr(attn_module.qk_norm.key_norm, 'weight') and attn_module.qk_norm.key_norm.weight is not None:
+            nn.init.ones_(attn_module.qk_norm.key_norm.weight)
+
     @apply_forward_hook
     def forward(self, x, context, context_attn_mask, timesteps):
         context = self.context_proj(context)

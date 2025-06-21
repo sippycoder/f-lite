@@ -12,9 +12,7 @@ import numpy as np
 import torch
 import torch.utils.checkpoint
 from torch.distributed._tensor import DTensor
-from accelerate import Accelerator
-from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, set_seed
+import torch.distributed.checkpoint as dcp
 from einops import rearrange
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 from PIL import Image
@@ -26,14 +24,16 @@ from transformers import (
     get_wsd_schedule
 )
 
+from f_lite.checkpoint import Checkpointer
 from f_lite.data import ImageDataset
+from f_lite.distributed import get_device_mesh_hybrid_sharding, get_global_rank, get_local_rank, get_world_size, is_main_process, parallelize_model, setup_torch_distributed
 from f_lite.pipeline import FLitePipeline
 from f_lite.precomputed_utils import (
     create_precomputed_data_loader,
     forward_with_precomputed_data,
 )
 from diffusers import AutoencoderKL
-from transformers import Qwen2_5_VLModel, Qwen2_5_VLProcessor
+from transformers import Qwen2_5_VLModel, AutoProcessor
 from f_lite.model import DiT
 from f_lite.sampler import StatefulDistributedSampler
 from f_lite.utils import make_image_grid
@@ -47,7 +47,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Set up logger
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Enable TF32 for faster training (only on NVIDIA Ampere or newer GPUs)
 torch._inductor.config.coordinate_descent_tuning = True
@@ -159,6 +159,7 @@ def parse_args():
                         help="Enable gradient checkpointing to save memory")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Maximum gradient norm for gradient clipping")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     # Logging and evaluation parameters
     parser.add_argument("--logging_dir", type=str, default="logs",
@@ -260,6 +261,7 @@ def create_data_loader(
         resolution=resolution,
         center_crop=center_crop,
         random_flip=random_flip,
+        debug=args.debug
     )
     
     # Create sampler - either resolution bucket or standard
@@ -287,7 +289,7 @@ def create_data_loader(
     
     return data_loader
 
-def _convert_caption_to_messages(caption: str, processor: Qwen2_5_VLProcessor) -> str:
+def _convert_caption_to_messages(caption: str, processor: AutoProcessor) -> str:
     messages = [
         {
             "role": "system",
@@ -385,6 +387,9 @@ def forward(
 
     # Get captions from metadata
     captions = metadatas[0]["long_caption"]
+
+    # print(captions)
+    # # ["The Cavalier King Charles Spaniel has a scruffy appearance, with a bit of white on its face and ears, and a darker brown color on its body. Its eyes are wide open and it's looking straight ahead with a slightly concerned expression. The dog is peeking out from under a vehicle, with only its face visible above the edge. The floor is a smooth, light-colored surface.", 'The sun is shining brightly over the ocean, creating lens flare effects. The sun is low in the sky, indicating it might be early morning or late afternoon. There are rocks in the foreground, and the waves gently lap against them. The water has a calm appearance with small ripples, reflecting the sunlight. The overall scene is peaceful and serene. The name "Uccio81" is visible in the top right corner.', 'The scene shows a yellow building with a brown door and a window on the left side. There is a bicycle leaning against the wall next to the window. The building has visible numbers, "357" and "361," above the door. There is a tree branch extending over the roof. The ground is a concrete sidewalk, and the street runs along the front of the building. The door is closed and appears to be wooden. The window has metal bars, and it seems to have glass panes with some reflections. The sky is clear.', "A close-up photo captures the moment a stream of honey is slowly dripping into a glass bowl. The honey has a rich, amber color, and the bowl appears to be made of glass. The honey creates ripples as it hits the surface of the water in the bowl. The liquid inside the bowl is clear, and the overall setting is illuminated by a bright light source, creating a sparkling effect. The scene is simple yet visually captivating, highlighting the honey's smooth, viscous texture. The year 2017 is visible at the bottom of the frame.", 'I see a group of animated characters walking in a line. They have distinct styles and poses. The group includes a woman with long dark hair wearing a green top and blue pants. Next to her is a man with spiky black hair in a white shirt. A man with a large brown afro and beard is wearing a red vest. Behind them, there are more characters, some holding weapons and tools. In the back, there\'s a man in a white shirt and hat. The bottom of the line is a man wearing a cap and holding a wrench. At the far right, there\'s a blue cat with a mechanical body. \n\nThey are on a road, and the text reads "walk more slowly." Above the text, there are logos and symbols, including a red cross on a white background. There is a banner with the word "NE PIECE" at the bottom of the poster.', 'The video captures a large medieval castle perched on a hill surrounded by lush greenery. The castle, made of dark brick, features several turrets with conical roofs and is enclosed by high walls. In the foreground, people can be seen walking around the castle\'s grounds, giving a sense of scale to the structure. The setting is serene, with trees and plants covering the landscape around the castle. A watermark indicating "Bejot Photography" is visible on the lower right corner.', 'The photo shows a supermarket aisle filled with an assortment of candy. There are various types of candy displayed in clear plastic containers and boxes. The shelves are well-stocked with an abundance of sweets, and some products have colorful packaging. You can see jars filled with what appears to be gummy candies in different colors and flavors, as well as boxes of other sweet treats. The overall scene is bright and inviting, showcasing a wide selection of confectionery items. ', 'A serene beach scene unfolds at sunset, where the sky is a blend of soft orange and blue hues. The sun, low on the horizon, casts a warm glow across the calm sea. A pier extends into the water, silhouetted against the glowing sky. Gentle waves lap against the sandy shore.', "A bench sits in front of a closed garage door with a turquoise background. The garage is part of a building with a white wall and a brick section on the left side. There's a patch of gravel in the foreground, and some plants are growing near the garage wall.", "I see a red shutter on a stone wall. It's closed, with metal latches. Next to it is a barred window. The shutter has a slightly weathered look. The shutter is set within a stone building. The window beside it has a grid pattern on the bars. The sunlight casts shadows on the wall.", 'The large green crane is lifting a heavy object. The crane arm is extended, and a mechanical arm with a drum is visible at the end. Cables are wrapped around the drum, ready to lift the load. The background is clear and blue.', 'A large, ancient structure with stone columns and an ornate pediment featuring intricate carvings is visible under a clear blue sky. The columns are tall, weathered, and arranged in a row. The top of the structure has a detailed entablature that displays a series of rectangular and triangular shapes, typical of classical architecture. The craftsmanship is evident in the precise design and weathered texture of the stone. The background is mostly sky, with some scattered clouds. ', 'A view from a high vantage point shows a vast, open landscape with rolling hills and lush greenery. The scene features a river winding through the valley, bordered by trees and fields. In the distance, mountains rise against the clear blue sky. The foreground has leafless branches and some sparse bushes.', 'A white cat with blue eyes is sitting on a tree stump outdoors. There are plants in the background and a plastic bottle is lying on the ground next to the cat.', 'The black and white photo captures a scene where a flock of birds perches on power lines against a backdrop of a cloudy sky and some trees. The birds are evenly distributed along the wires, with a mix of different types of birds visible. The composition creates a striking silhouette effect. The overall atmosphere is serene and peaceful.', 'A beautifully decorated room with a large Christmas tree adorned with lights and ornaments stands in the corner, surrounded by people who are setting up or adjusting decorations. The room has a warm ambiance with candles on the tables and large wreaths hanging on the walls. Tables are arranged in a U-shape with chairs placed neatly around them, and the table settings are formal, featuring gold chargers and red napkins. The floor is wooden, and the overall setting suggests preparations for a festive holiday event.']
     
     # Process images and captions
     preprocess_start = time.time()
@@ -611,6 +616,11 @@ def sample_images(
     return image_grid
 
 
+def build_fsdp_grouping_plan(model: DiT):
+    group_plan = [(block, False) for block in model.blocks]
+    return group_plan
+
+
 def train(args):
     """
     Main training function.
@@ -618,58 +628,48 @@ def train(args):
     Args:
         args: Script arguments
     """
-    # Initialize accelerator
-    logging_dir = os.path.join(args.output_dir, args.logging_dir)
-    project_config = ProjectConfiguration(
-        project_dir=args.output_dir,
-        logging_dir=logging_dir,
-    )
-    
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
-        project_config=project_config,
-    )
+    setup_torch_distributed()
+    device_mesh = get_device_mesh_hybrid_sharding()
+    world_size = get_world_size()
+    global_rank = get_global_rank()
+    local_rank = get_local_rank()
+    device = f"cuda:{local_rank}"
     
     # Setup logging
+    log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
+        level=log_level,
     )
     
     # Set logger level for various components
-    if accelerator.is_main_process:
+    if is_main_process():
         transformers_logger = logging.getLogger("transformers")
         transformers_logger.setLevel(logging.WARNING)
     
-    logger.info(accelerator.state, main_process_only=False)
-    
-    # Determine device
-    device = accelerator.device
-    
     # Set random seed for reproducibility
     if args.seed is not None:
-        set_seed(args.seed)
+        random.seed(args.seed)
+        np.random.seed(args.seed)
         # Create a common seed for data loading
         common_seed = args.seed
     else:
         common_seed = random.randint(0, 1000000)
     
     logger.info(f"Using random seed: {common_seed}")
+
+    torch.manual_seed(common_seed)
     
     # Initialize wandb if needed
-    if args.report_to in ["wandb", "all"]:
+    if args.report_to in ["wandb", "all"] and is_main_process():
         run_name = args.run_name if args.run_name else f"DiT-pretrain-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
-        
-        # Let accelerator handle wandb initialization
-        accelerator.init_trackers(
-            project_name=args.project_name,
+        wandb.init(
+            project=args.project_name,
+            name=run_name,
             config=vars(args),
-            init_kwargs={"wandb": {"name": run_name}}
         )
-     
+    
     if args.pretrained_model_path is not None:
         logger.info(f"Loading model from {args.pretrained_model_path}")
         pipeline = FLitePipeline.from_pretrained(
@@ -678,10 +678,10 @@ def train(args):
         )
     else:
         vae = AutoencoderKL.from_pretrained(args.vae_path)
-        text_encoder = Qwen2_5_VLModel.from_pretrained(args.text_encoder_path)
+        text_encoder = Qwen2_5_VLModel.from_pretrained(args.text_encoder_path, torch_dtype=torch.bfloat16)
         if apply_liger_kernel_to_qwen2_5_vl is not None:
             apply_liger_kernel_to_qwen2_5_vl(text_encoder)
-        processor = Qwen2_5_VLProcessor.from_pretrained(args.processor_path)
+        processor = AutoProcessor.from_pretrained(args.processor_path)
         dit_model = DiT(
             in_channels=vae.config.latent_channels,
             patch_size=2,
@@ -706,9 +706,7 @@ def train(args):
     if args.use_precomputed_data:
         # Only load DiT model if using precomputed data
         dit_model = pipeline.dit_model
-        dit_model.to(torch.bfloat16)
-        dit_model.to(device)
-
+        
         # Set VAE and text_encoder to None to save memory
         vae_model = None
         text_encoder = None
@@ -723,10 +721,7 @@ def train(args):
         processor = pipeline.processor
 
         # Move models to device
-        dit_model = dit_model.to(torch.bfloat16)
-        dit_model = dit_model.to(device)
         vae_model = vae_model.to(device)
-        text_encoder = text_encoder.to(torch.bfloat16)
         text_encoder = text_encoder.to(device)
 
         # Freeze encoders (they are only used for inference)
@@ -824,8 +819,8 @@ def train(args):
             center_crop=args.center_crop,
             random_flip=args.random_flip,
             use_resolution_buckets=args.use_resolution_buckets,
-            num_processes=accelerator.num_processes,
-            process_index=accelerator.process_index,
+            num_processes=world_size,
+            process_index=global_rank,
         )
 
         val_dataloader = None
@@ -836,8 +831,8 @@ def train(args):
                 base_image_dir=args.base_image_dir,
                 shuffle=False,
                 num_workers=4,
-                num_processes=accelerator.num_processes,
-                process_index=accelerator.process_index,
+                num_processes=world_size,
+                process_index=global_rank,
             )
     
     # Initialize optimizer
@@ -867,32 +862,34 @@ def train(args):
     if args.lr_scheduler == "cosine":
         lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
-            num_training_steps=max_steps * accelerator.num_processes,
+            num_warmup_steps=args.num_warmup_steps,
+            num_training_steps=max_steps,
         )
     elif args.lr_scheduler == "linear":
         lr_scheduler = get_linear_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
-            num_training_steps=max_steps * accelerator.num_processes,
+            num_warmup_steps=args.num_warmup_steps,
+            num_training_steps=max_steps,
         )
     elif args.lr_scheduler == "wsd":
         lr_scheduler = get_wsd_schedule(
             optimizer=optimizer,
-            num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
-            num_decay_steps=max_steps // 10 * accelerator.num_processes,  # 10% of the training steps for decay
-            num_stable_steps=(max_steps - args.num_warmup_steps - max_steps // 10) * accelerator.num_processes,  # 90% of the training steps for stable
+            num_warmup_steps=args.num_warmup_steps,
+            num_decay_steps=max_steps // 10,  # 10% of the training steps for decay
+            num_stable_steps=max_steps - args.num_warmup_steps - max_steps // 10,  # 90% of the training steps for stable
         )
     else:  # constant with warmup
         lr_scheduler = get_linear_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
-            num_training_steps=max_steps * accelerator.num_processes * 1000,  # Very long decay to simulate constant
+            num_warmup_steps=args.num_warmup_steps,
+            num_training_steps=max_steps * 1000,  # Very long decay to simulate constant
         )
     
-    # Prepare with accelerator
-    dit_model, optimizer, lr_scheduler = accelerator.prepare(
-        dit_model, optimizer, lr_scheduler
+    dit_model = parallelize_model(
+        model=dit_model, 
+        device_mesh=device_mesh, 
+        param_dtype=torch.bfloat16,
+        fsdp_grouping_plan=build_fsdp_grouping_plan(dit_model),
     )
 
     if args.use_lora: 
@@ -902,73 +899,38 @@ def train(args):
             betas=(0.9, 0.95),
             weight_decay=args.weight_decay,
         )
-        optimizer = accelerator.prepare(optimizer)
     
-    if val_dataloader:
-        val_dataloader = accelerator.prepare(val_dataloader)
-    
-    if args.resume_from_checkpoint:
+    os.makedirs(args.output_dir, exist_ok=True)
+    checkpointer = Checkpointer(args.output_dir, dcp_api=True)
+    if args.resume_from_checkpoint and checkpointer.last_training_time:
         checkpoint_path = args.resume_from_checkpoint
+        last_training_time = None
         
         if checkpoint_path == "latest":
-            os.makedirs(args.output_dir, exist_ok=True)
-            dirs = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")]
-            if len(dirs) > 0:
-                dirs.sort(key=lambda d: int(d.split("-")[1]))
-                checkpoint_path = os.path.join(args.output_dir, dirs[-1])
-            else:
-                checkpoint_path = None
-        
-        if checkpoint_path:
-            logger.info(f"Resuming from checkpoint: {checkpoint_path}")
-    
-            if os.path.isdir(checkpoint_path) and not os.path.exists(os.path.join(checkpoint_path, "optimizer.bin")):
-                # This handles loading just the model weights without optimizer state
-                pipeline = FLitePipeline.from_pretrained(
-                    checkpoint_path,
-                    torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else None
-                )
-    
-                dit_model = pipeline.dit_model.to(device)
-    
-                # Load LoRA weights if using LoRA and checkpoint contains them
-                if args.use_lora and os.path.exists(os.path.join(checkpoint_path, "lora_weights.pt")):
-                    logger.info(f"Loading LoRA weights from {checkpoint_path}/lora_weights.pt")
-                    lora_state_dict = torch.load(os.path.join(checkpoint_path, "lora_weights.pt"), map_location=device)
-                    set_peft_model_state_dict(dit_model, lora_state_dict)
-    
-                dit_model, optimizer, lr_scheduler = accelerator.prepare(
-                    dit_model, optimizer, lr_scheduler
-                )
-                
-                # Extract step number from checkpoint path
-                global_step = int(checkpoint_path.split("-")[-1])
-            else:
-                # This uses accelerator's state loading which includes optimizer state
-                accelerator.load_state(checkpoint_path)
-                
-                # Extract step number from checkpoint path
-                global_step = int(checkpoint_path.split("-")[-1])
-            
-            # Load the sampler state
-            sampler_state = torch.load(os.path.join(checkpoint_path, "sampler_state.bin"))
-            train_dataloader.sampler.load_state_dict(sampler_state)
-            logger.info(f"Sampler state loaded from {os.path.join(checkpoint_path, 'sampler_state.bin')}")
+            last_training_time = checkpointer.last_training_time
+            logger.info(f"Resuming from checkpoint at {last_training_time}")
+            global_step = last_training_time
         else:
-            logger.info("No checkpoint found, starting from scratch")
-            global_step = 0
+            logger.info(f"Resuming from checkpoint: {checkpoint_path}")
+            global_step = int(checkpoint_path.split("/")[-1])
+    
+        checkpointer.load_model(dit_model, last_training_time, checkpoint_path)
+        checkpointer.load_optim(dit_model, optimizer, last_training_time, checkpoint_path)
+        checkpointer.load_sampler_state(train_dataloader.sampler, last_training_time, checkpoint_path)
     else:
-        logger.info("No checkpoint specified, starting from scratch")
+        logger.info("No checkpoint found, starting from scratch")
         global_step = 0
+        dit_model.to_empty(device=device)
+        dit_model.reset_parameters()
     
     # Initialize training progress bar
     progress_bar = tqdm(
         total=max_steps,
         initial=global_step,
-        disable=not accelerator.is_main_process,
+        disable=not is_main_process(),
         desc="Training",
     )
-    
+
     # Binning for loss analysis
     diffusion_loss_binning = {k: 0 for k in range(10)}
     diffusion_loss_binning_count = {k: 0 for k in range(10)}
@@ -991,240 +953,228 @@ def train(args):
         epoch_start_time = time.time()
         
         for step, batch in enumerate(train_dataloader):    
-            with accelerator.accumulate(dit_model):
-                # Forward pass
-                if args.use_precomputed_data:
-                    total_loss, diffusion_loss = forward_with_precomputed_data(
-                        dit_model=dit_model,
-                        batch=batch,
-                        device=device,
-                        global_step=global_step,
-                        master_process=accelerator.is_main_process,
-                        binnings=(diffusion_loss_binning, diffusion_loss_binning_count),
-                        batch_multiplicity=args.batch_multiplicity,
-                        bs_rampup=None,  # We let accelerate handle this
-                        batch_size=args.train_batch_size,
-                    )
-                else:
-                    total_loss, diffusion_loss = forward(
-                        dit_model=dit_model,
-                        batch=batch,
-                        vae_model=vae_model,
-                        text_encoder=text_encoder,
-                        processor=processor,
-                        device=device,
-                        global_step=global_step,
-                        master_process=accelerator.is_main_process,
-                        binnings=(diffusion_loss_binning, diffusion_loss_binning_count),
-                        batch_multiplicity=args.batch_multiplicity,
-                        bs_rampup=None,  # We let accelerate handle this
-                        batch_size=args.train_batch_size,
-                        return_index=-8,
-                    )
+            # Forward pass
+            if args.use_precomputed_data:
+                total_loss, diffusion_loss = forward_with_precomputed_data(
+                    dit_model=dit_model,
+                    batch=batch,
+                    device=device,
+                    global_step=global_step,
+                    master_process=is_main_process(),
+                    binnings=(diffusion_loss_binning, diffusion_loss_binning_count),
+                    batch_multiplicity=args.batch_multiplicity,
+                    bs_rampup=None,
+                    batch_size=args.train_batch_size,
+                )
+            else:
+                total_loss, diffusion_loss = forward(
+                    dit_model=dit_model,
+                    batch=batch,
+                    vae_model=vae_model,
+                    text_encoder=text_encoder,
+                    processor=processor,
+                    device=device,
+                    global_step=global_step,
+                    master_process=is_main_process(),
+                    binnings=(diffusion_loss_binning, diffusion_loss_binning_count),
+                    batch_multiplicity=args.batch_multiplicity,
+                    bs_rampup=None,
+                    batch_size=args.train_batch_size,
+                    return_index=-8,
+                )
                 
                 # Backward pass
-                accelerator.backward(total_loss)
+                total_loss.backward()
                 
-                # Clip gradients
-                if accelerator.sync_gradients:
-                    grad_norm = accelerator.clip_grad_norm_(dit_model.parameters(), args.max_grad_norm)
-                else:
-                    grad_norm = None
-                
+                grad_norm = torch.nn.utils.clip_grad_norm_(dit_model.parameters(), args.max_grad_norm)
+
                 # Update optimizer and scheduler
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
             
             # Update progress bar
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
-                
-                # Logging
-                if global_step % 10 == 0 and accelerator.is_main_process:
-                    logs = {
-                        "train/loss": total_loss.item(),
-                        "train/diffusion_loss": diffusion_loss.item(),
-                        "train/lr": lr_scheduler.get_last_lr()[0],
-                        "train/epoch": epoch,
-                        "train/step": global_step,
-                    }
+            progress_bar.update(1)
+            global_step += 1
+            
+            # Logging
+            if global_step % 10 == 0 and is_main_process():
+                logs = {
+                    "train/loss": total_loss.item(),
+                    "train/diffusion_loss": diffusion_loss.item(),
+                    "train/lr": lr_scheduler.get_last_lr()[0],
+                    "train/epoch": epoch,
+                    "train/step": global_step,
+                }
 
-                    if grad_norm is not None:
-                        logs["train/grad_norm"] = (
-                            grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else grad_norm
-                        ).item()
+                if grad_norm is not None:
+                    logs["train/grad_norm"] = (
+                        grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else grad_norm
+                    ).item()
 
-                    # Log average bin loss
-                    for i in range(10):
-                        if diffusion_loss_binning_count[i] > 0:
-                            avg_bin_loss = (
-                                diffusion_loss_binning[i]
-                                / diffusion_loss_binning_count[i]
-                            )
-                            logs[f"metrics/avg_loss_bin_{i}"] = avg_bin_loss
-                    
-                    # Log bin counts as a histogram
-                    if any(diffusion_loss_binning_count.values()):
-                        for tracker in accelerator.trackers:
-                            if tracker.name == "wandb":
-                                raw_data = []
-                                for bin_idx, count in diffusion_loss_binning_count.items():
-                                    raw_data.extend([bin_idx] * int(count))
-                                tracker.log(
-                                    {"metrics/diffusion_loss_bin_counts": wandb.Histogram(raw_data)},
-                                    step=global_step,
-                                )
-
-                    # Reset binning stats for next logging interval
-                    diffusion_loss_binning.clear()
-                    diffusion_loss_binning.update({k: 0 for k in range(10)})
-                    diffusion_loss_binning_count.clear()
-                    diffusion_loss_binning_count.update({k: 0 for k in range(10)})
-                    
-                    # Log to all trackers
-                    accelerator.log(logs, step=global_step)
-                    
-                    # Update progress bar
-                    progress_bar.set_postfix({
-                        "loss": f"{total_loss.item():.4f}",
-                        "diff_loss": f"{diffusion_loss.item():.4f}",
-                        "lr": f"{lr_scheduler.get_last_lr()[0]:.7f}",
-                    }) 
-                
-                # Save checkpoint
-                if global_step % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved checkpoint to {save_path}")
-                        sampler_state = train_dataloader.sampler.state_dict(global_step)
-                        torch.save(sampler_state, os.path.join(save_path, "sampler_state.bin"))
-                        logger.info(f"Saved sampler state to {os.path.join(save_path, 'sampler_state.bin')}")
-
-                        # Remove old checkpoints
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = [
-                                d
-                                for d in os.listdir(args.output_dir)
-                                if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.output_dir, d))
-                            ]
-                            # Sort by step number (ascending)
-                            checkpoints.sort(key=lambda x: int(x.split("-")[1]))
-
-                            if len(checkpoints) > args.checkpoints_total_limit:
-                                num_to_delete = len(checkpoints) - args.checkpoints_total_limit
-                                for ckpt_to_delete in checkpoints[:num_to_delete]:
-                                    shutil.rmtree(os.path.join(args.output_dir, ckpt_to_delete))
-                                    logger.info(f"Removed old checkpoint: {ckpt_to_delete}")
-
-                # Sample images
-                if global_step % args.sample_every == 0 and accelerator.is_main_process:
-                    # For sampling, we need VAE and text encoder
-                    temp_vae = None
-                    temp_text_encoder = None
-                    temp_tokenizer = None
-    
-                    if args.use_precomputed_data:
-                        # Temporarily load VAE and text encoder for sampling
-                        logger.info("Temporarily loading VAE and text encoder for sampling")
-                        temp_pipeline = FLitePipeline.from_pretrained(
-                            args.pretrained_model_path,
-                            torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else None
+                # Log average bin loss
+                for i in range(10):
+                    if diffusion_loss_binning_count[i] > 0:
+                        avg_bin_loss = (
+                            diffusion_loss_binning[i]
+                            / diffusion_loss_binning_count[i]
                         )
-                        temp_vae = temp_pipeline.vae.to(device)
-                        temp_text_encoder = temp_pipeline.text_encoder.to(device)
-                        temp_tokenizer = temp_pipeline.tokenizer
+                        logs[f"metrics/avg_loss_bin_{i}"] = avg_bin_loss
+                
+                # Log bin counts as a histogram
+                if any(diffusion_loss_binning_count.values()):
+                    raw_data = []
+                    for bin_idx, count in diffusion_loss_binning_count.items():
+                        raw_data.extend([bin_idx] * int(count))
+                    wandb.log(
+                        {"metrics/diffusion_loss_bin_counts": wandb.Histogram(raw_data)},
+                        step=global_step,
+                    )
 
-                        # Use temporary models for sampling
-                        image_grid = sample_images(
-                            dit_model=accelerator.unwrap_model(dit_model),
-                            vae_model=temp_vae,
-                            text_encoder=temp_text_encoder,
-                            tokenizer=temp_tokenizer,
-                            device=device,
-                            global_step=global_step,
-                            prompts=None,  # Use default prompts as fallback
-                            image_width=256,
-                            image_height=256,
-                            prompts_per_gpu=2,
-                            prompts_file=args.sample_prompts_file,
-                        )
+                # Reset binning stats for next logging interval
+                diffusion_loss_binning.clear()
+                diffusion_loss_binning.update({k: 0 for k in range(10)})
+                diffusion_loss_binning_count.clear()
+                diffusion_loss_binning_count.update({k: 0 for k in range(10)})
+                
+                # Log to all trackers
+                wandb.log(logs, step=global_step)
+                
+                # Update progress bar
+                progress_bar.set_postfix({
+                    "loss": f"{total_loss.item():.4f}",
+                    "diff_loss": f"{diffusion_loss.item():.4f}",
+                    "lr": f"{lr_scheduler.get_last_lr()[0]:.7f}",
+                }) 
+            
+            # Save checkpoint
+            if global_step % args.checkpointing_steps == 0:
+                if is_main_process():
+                    checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
+                    logger.info(f"Saved checkpoint to {args.output_dir}/{global_step}")
 
-                        # Clean up temporary models
-                        del temp_vae, temp_text_encoder, temp_tokenizer, temp_pipeline
-                        torch.cuda.empty_cache()
-                    else:
-                        # Use existing models
-                        image_grid = sample_images(
-                            dit_model=accelerator.unwrap_model(dit_model),
+                    # Remove old checkpoints
+                    if args.checkpoints_total_limit is not None:
+                        checkpoints = [
+                            d
+                            for d in os.listdir(args.output_dir)
+                            if os.path.isdir(os.path.join(args.output_dir, d))
+                        ]
+                        # Sort by step number (ascending)
+                        checkpoints.sort(key=lambda x: int(x))
+
+                        if len(checkpoints) > args.checkpoints_total_limit:
+                            num_to_delete = len(checkpoints) - args.checkpoints_total_limit
+                            for ckpt_to_delete in checkpoints[:num_to_delete]:
+                                shutil.rmtree(os.path.join(args.output_dir, ckpt_to_delete))
+                                logger.info(f"Removed old checkpoint: {ckpt_to_delete}")
+
+            # Sample images
+            if global_step % args.sample_every == 0 and is_main_process():
+                # For sampling, we need VAE and text encoder
+                temp_vae = None
+                temp_text_encoder = None
+                temp_tokenizer = None
+
+                if args.use_precomputed_data:
+                    # Temporarily load VAE and text encoder for sampling
+                    logger.info("Temporarily loading VAE and text encoder for sampling")
+                    temp_pipeline = FLitePipeline.from_pretrained(
+                        args.pretrained_model_path,
+                        torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else None
+                    )
+                    temp_vae = temp_pipeline.vae.to(device)
+                    temp_text_encoder = temp_pipeline.text_encoder.to(device)
+                    temp_tokenizer = temp_pipeline.tokenizer
+
+                    # Use temporary models for sampling
+                    image_grid = sample_images(
+                        dit_model=dit_model,
+                        vae_model=temp_vae,
+                        text_encoder=temp_text_encoder,
+                        tokenizer=temp_tokenizer,
+                        device=device,
+                        global_step=global_step,
+                        prompts=None,  # Use default prompts as fallback
+                        image_width=256,
+                        image_height=256,
+                        prompts_per_gpu=2,
+                        prompts_file=args.sample_prompts_file,
+                    )
+
+                    # Clean up temporary models
+                    del temp_vae, temp_text_encoder, temp_tokenizer, temp_pipeline
+                    torch.cuda.empty_cache()
+                else:
+                    # Use existing models
+                    image_grid = sample_images(
+                        dit_model=dit_model,
+                        vae_model=vae_model,
+                        text_encoder=text_encoder,
+                        processor=processor,
+                        device=device,
+                        global_step=global_step,
+                        prompts=None,  # Use default prompts as fallback
+                        image_width=256,
+                        image_height=256,
+                        prompts_per_gpu=2,
+                        prompts_file=args.sample_prompts_file,
+                    )
+            
+                # Save image grid to wandb
+                wandb.log({
+                    "samples": [wandb.Image(image_grid, caption=f"Step {global_step}")],
+                }, step=global_step)
+            
+            # Run evaluation
+            if val_dataloader and global_step % args.eval_every == 0:
+                logger.info(f"Running evaluation at step {global_step}")
+                dit_model.eval()
+                
+                val_loss = 0.0
+                val_diffusion_loss = 0.0
+                val_count = 0
+                
+                # Evaluate on validation set
+                for val_step, val_batch in enumerate(val_dataloader):
+                    with torch.no_grad():
+                        val_total_loss, val_diff_loss = forward(
+                            dit_model=dit_model,
+                            batch=val_batch,
                             vae_model=vae_model,
                             text_encoder=text_encoder,
                             processor=processor,
                             device=device,
                             global_step=global_step,
-                            prompts=None,  # Use default prompts as fallback
-                            image_width=256,
-                            image_height=256,
-                            prompts_per_gpu=2,
-                            prompts_file=args.sample_prompts_file,
+                            master_process=is_main_process(),
+                            return_index=-8,
                         )
-                
-                    # Save image grid to wandb
-                    accelerator.log({
-                        "samples": [wandb.Image(image_grid, caption=f"Step {global_step}")],
-                    }, step=global_step)
-                
-                # Run evaluation
-                if val_dataloader and global_step % args.eval_every == 0:
-                    logger.info(f"Running evaluation at step {global_step}")
-                    dit_model.eval()
-                    
-                    val_loss = 0.0
-                    val_diffusion_loss = 0.0
-                    val_count = 0
-                    
-                    # Evaluate on validation set
-                    for val_step, val_batch in enumerate(val_dataloader):
-                        with torch.no_grad():
-                            val_total_loss, val_diff_loss = forward(
-                                dit_model=dit_model,
-                                batch=val_batch,
-                                vae_model=vae_model,
-                                text_encoder=text_encoder,
-                                processor=processor,
-                                device=device,
-                                global_step=global_step,
-                                master_process=accelerator.is_main_process,
-                                return_index=-8,
-                            )
-                            
-                            val_loss += val_total_loss.item()
-                            val_diffusion_loss += val_diff_loss.item()
-                            val_count += 1
-                            
-                            # Limit validation to 20 batches
-                            if val_step >= 19:
-                                break
-                    
-                    # Calculate average validation loss
-                    if val_count > 0:
-                        val_loss /= val_count
-                        val_diffusion_loss /= val_count
                         
-                        # Log validation results
-                        if accelerator.is_main_process:
-                            logs = {
-                                "val/loss": val_loss,
-                                "val/diffusion_loss": val_diffusion_loss,
-                            }
-                            accelerator.log(logs, step=global_step)
-                            
-                            logger.info(f"Validation Loss: {val_loss:.4f}")
+                        val_loss += val_total_loss.item()
+                        val_diffusion_loss += val_diff_loss.item()
+                        val_count += 1
+                        
+                        # Limit validation to 20 batches
+                        if val_step >= 19:
+                            break
+                
+                # Calculate average validation loss
+                if val_count > 0:
+                    val_loss /= val_count
+                    val_diffusion_loss /= val_count
                     
-                    # Set model back to training mode
-                    dit_model.train()
+                    # Log validation results
+                    if is_main_process():
+                        logs = {
+                            "val/loss": val_loss,
+                            "val/diffusion_loss": val_diffusion_loss,
+                        }
+                        wandb.log(logs, step=global_step)
+                        
+                        logger.info(f"Validation Loss: {val_loss:.4f}")
+                
+                # Set model back to training mode
+                dit_model.train()
             
             # Check if we've reached max steps
             if global_step >= max_steps:
@@ -1236,12 +1186,9 @@ def train(args):
         logger.info(f"Epoch {epoch+1} completed in {epoch_time:.2f} seconds")
         
         # Save model at the end of each epoch
-        if accelerator.is_main_process:
-            save_path = os.path.join(args.output_dir, f"epoch-{epoch+1}")
-            os.makedirs(save_path, exist_ok=True)
-            
-            accelerator.save_state(save_path)
-            logger.info(f"Saved checkpoint to {save_path}")
+        if is_main_process():
+            checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
+            logger.info(f"Saved checkpoint to {args.output_dir}/{global_step}")
         
         # Check if we've reached max steps
         if global_step >= max_steps:
@@ -1251,25 +1198,22 @@ def train(args):
     logger.info(f"Training completed after {global_step} steps!")
     
     # Save the final model
-    if accelerator.is_main_process:
+    if is_main_process():
         final_model_path = os.path.join(args.output_dir, "final_model")
         os.makedirs(final_model_path, exist_ok=True)
         
-        unwrapped_model = accelerator.unwrap_model(dit_model)
-        torch.save(unwrapped_model.state_dict(), os.path.join(final_model_path, "model.pt"))
+        checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
         logger.info(f"Final model saved to {final_model_path}")
 
         # Save LoRA weights separately if using LoRA
         if args.use_lora:
-            lora_state_dict = get_peft_model_state_dict(unwrapped_model)
+            lora_state_dict = get_peft_model_state_dict(dit_model)
             torch.save(
                 lora_state_dict,
                 os.path.join(final_model_path, "lora_weights.pt")
             )
             logger.info(f"Saved final LoRA weights to {final_model_path}/lora_weights.pt")
         
-    # End training with accelerator
-    accelerator.end_training()
 
 if __name__ == "__main__":
     args = parse_args()

@@ -74,16 +74,17 @@ if [ -d "/opt/sagemaker_cluster" ]; then
     AUTO_RESUME="--auto-resume=1"
 fi
 
-ACCELERATE_CMD="accelerate launch --config_file fsdp2_config.yaml"
+TORCHRUN_CMD="torchrun"
 
-# ACCELERATE_ARGS:
-# accelerate will use the MASTER_ADDR and MASTER_PORT for rendezvous.
-# nnodes and node_rank are typically auto-detected by accelerate from Slurm environment variables.
-declare -a ACCELERATE_ARGS=(
-    "--log_dir=${LOG_DIR}/job_${SLURM_JOB_ID}_node_${SLURM_NODEID}" # Per-node accelerate logs
-    "--num_machines=${SLURM_NNODES}"
-    "--main_process_ip=${MASTER_ADDR}"
-    "--main_process_port=${MASTER_PORT}"
+# TORCHRUN_ARGS:
+# torchrun will use the PytorchMASTER_ADDR and PytorchMASTER_PORT for rendezvous.
+# nnodes and node_rank are typically auto-detected by torchrun from Slurm environment variables.
+declare -a TORCHRUN_ARGS=(
+    "--nnodes=${SLURM_NNODES}"
+    "--nproc_per_node=8"
+    "--rdzv_backend=c10d"
+    "--rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT}"
+    "--log_dir=${LOG_DIR}/torchrun_logs/job_${SLURM_JOB_ID}_node_${SLURM_NODEID}" # Per-node torchrun logs
 )
 
 # Training script module and its arguments
@@ -126,6 +127,7 @@ declare -a TRAINING_ARGS=(
     "--batch_multiplicity" "1"
     "--sample_every" "5000"
     "--sample_prompts_file" "prompts.txt"
+    "--debug"
 )
 
 echo "--- srun command execution ---"
@@ -138,8 +140,8 @@ echo "Current working directory: $(pwd)"
 # The -l flag labels srun output lines with the task number.
 # srun will launch this command once per node (due to --ntasks-per-node=1).
 
-echo "ACCELERATE_CMD: ${ACCELERATE_CMD}"
-echo "ACCELERATE_ARGS: ${ACCELERATE_ARGS[*]}"
+echo "TORCHRUN_CMD: ${TORCHRUN_CMD}"
+echo "TORCHRUN_ARGS: ${TORCHRUN_ARGS[*]}"
 echo "TRAIN_SCRIPT_ARGS: ${TRAIN_SCRIPT_ARGS[*]}"
 echo "TRAINING_ARGS: ${TRAINING_ARGS[*]}"
 
@@ -147,8 +149,8 @@ echo "TRAINING_ARGS: ${TRAINING_ARGS[*]}"
 export PATH FI_PROVIDER FI_EFA_USE_DEVICE_RDMA FI_EFA_USE_HUGE_PAGE FI_EFA_SET_CUDA_SYNC_MEMOPS NCCL_PROTO NCCL_SOCKET_IFNAME LD_PRELOAD MASTER_ADDR MASTER_PORT
 
 srun ${AUTO_RESUME} \
-    ${ACCELERATE_CMD} \
-    ${ACCELERATE_ARGS[@]} \
+    ${TORCHRUN_CMD} \
+    ${TORCHRUN_ARGS[@]} \
     ${TRAIN_SCRIPT_ARGS[@]} \
     ${TRAINING_ARGS[@]}
 
