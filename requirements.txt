@@ -10,3 +10,8 @@ torch
 torchvision
 transformers
 gradio
+boto3
+dotenv
+ijson
+wandb
+liger_kernel
