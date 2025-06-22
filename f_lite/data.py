@@ -19,6 +19,14 @@ import boto3
 from tqdm import tqdm
 from urllib3 import Retry
 from dotenv import load_dotenv
+import ijson
+
+logging.getLogger("PIL").setLevel(logging.WARNING)
+logging.getLogger("pymongo").setLevel(logging.WARNING)
+boto3.set_stream_logger("boto3", level=logging.WARNING)
+boto3.set_stream_logger("botocore", level=logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+Image.MAX_IMAGE_PIXELS = None
 
 load_dotenv()
 
@@ -150,10 +158,22 @@ class BaseDataset(Dataset):
                 # Note: used for debugging
                 if self.debug and data_size > 10240:
                     break
+            self.data = pd.concat(data, ignore_index=True)
+        elif self.root_dir_type == "json":
+            logging.info(f"Loading data from local parquet files: {self.root_dir}")
+
+            file_path = os.path.join(self.root_dir, f"{self.collection_name}.json")
+            data = []
+            with open(file_path, "r") as file:
+                for item in tqdm(ijson.items(file, "item"), desc=f"Loading data"):
+                    data.append(item)
+                    # Note: used for debugging
+                    if self.debug and len(data) > 10000000:
+                        break
+            self.data = pd.DataFrame(data).reset_index()
         else:
             raise ValueError(f"Invalid Root Directory Type. Set root_dir_type to 'json' or 'parquet'")
 
-        self.data = pd.concat(data, ignore_index=True)
         end_time = time.time()  # Record the end time
         # Calculate the duration in seconds
         elapsed_time = end_time - start_time
@@ -193,7 +213,7 @@ class ImageDataset(BaseDataset):
         )
         self.image_column = image_column
         self.caption_column = caption_column
-        self.image_processing = PolluxImageProcessing(resolution, max_ratio=1.0)
+        self.image_processing = PolluxImageProcessing(resolution, max_ratio=1.0 if center_crop else 2.0)
         self.retries = 3
         self.place_holder_image = Image.new("RGB", (resolution, resolution))
         
