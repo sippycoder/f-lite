@@ -106,6 +106,10 @@ class RMSNorm(nn.Module):
             return (x * norm * self.weight).to(dtype=x_dtype)
         else:
             return (x * norm).to(dtype=x_dtype)
+    
+    def reset_parameters(self):
+        if self.weight is not None:
+            nn.init.ones_(self.weight)
 
 
 class QKNorm(nn.Module):
@@ -120,6 +124,10 @@ class QKNorm(nn.Module):
         q = self.query_norm(q)
         k = self.key_norm(k)
         return q, k
+
+    def reset_parameters(self):
+        self.query_norm.reset_parameters()
+        self.key_norm.reset_parameters()
 
 
 class Attention(nn.Module):
@@ -204,6 +212,16 @@ class Attention(nn.Module):
         x = self.proj(x)
         return x
 
+    def reset_parameters(self):
+        if hasattr(self, 'qkv'):
+            self.qkv.reset_parameters()
+        if hasattr(self, 'q'):
+            self.q.reset_parameters()
+        if hasattr(self, 'context_kv'):
+            self.context_kv.reset_parameters()
+        self.proj.reset_parameters()
+        self.qk_norm.reset_parameters()
+
 
 class DiTBlock(nn.Module):
     def __init__(
@@ -283,6 +301,18 @@ class DiTBlock(nn.Module):
         x = x + self.mlp(norm_x) * gate_mlp
 
         return x
+    
+    def reset_parameters(self):
+        nn.init.ones_(self.norm1.weight)
+        self.self_attn.reset_parameters()
+        if self.norm2 is not None:
+            nn.init.ones_(self.norm2.weight)
+            self.cross_attn.reset_parameters()
+        nn.init.ones_(self.norm3.weight)
+        self.mlp.gate_proj.reset_parameters()
+        self.mlp.up_proj.reset_parameters()
+        self.mlp.down_proj.reset_parameters()
+
 
 
 class PatchEmbed(nn.Module):
@@ -296,26 +326,32 @@ class PatchEmbed(nn.Module):
         x = self.patch_proj(x)
         x = rearrange(x, "b c h w -> b (h w) c")
         return x
+    
+    def reset_parameters(self):
+        self.patch_proj.reset_parameters()
 
 
 class TwoDimRotary(torch.nn.Module):
     def __init__(self, dim, base=10000, h=256, w=256):
         super().__init__()
-        self.inv_freq = torch.FloatTensor([1.0 / (base ** (i / dim)) for i in range(0, dim, 2)])
+        self.dim = dim
+        self.base = base
         self.h = h
         self.w = w
+        
+        inv_freq = torch.FloatTensor([1.0 / (self.base ** (i / self.dim)) for i in range(0, self.dim, 2)])
 
-        t_h = torch.arange(h, dtype=torch.float32)
-        t_w = torch.arange(w, dtype=torch.float32)
+        t_h = torch.arange(self.h, dtype=torch.float32)
+        t_w = torch.arange(self.w, dtype=torch.float32)
 
-        freqs_h = torch.outer(t_h, self.inv_freq).unsqueeze(1)  # h, 1, d / 2
-        freqs_w = torch.outer(t_w, self.inv_freq).unsqueeze(0)  # 1, w, d / 2
-        freqs_h = freqs_h.repeat(1, w, 1)  # h, w, d / 2
-        freqs_w = freqs_w.repeat(h, 1, 1)  # h, w, d / 2
+        freqs_h = torch.outer(t_h, inv_freq).unsqueeze(1)  # h, 1, d / 2
+        freqs_w = torch.outer(t_w, inv_freq).unsqueeze(0)  # 1, w, d / 2
+        freqs_h = freqs_h.repeat(1, self.w, 1)  # h, w, d / 2
+        freqs_w = freqs_w.repeat(self.h, 1, 1)  # h, w, d / 2
         freqs_hw = torch.cat([freqs_h, freqs_w], 2)  # h, w, d
 
-        self.register_buffer("freqs_hw_cos", freqs_hw.cos())
-        self.register_buffer("freqs_hw_sin", freqs_hw.sin())
+        self.register_buffer("freqs_hw_cos", freqs_hw.cos(), persistent=False)
+        self.register_buffer("freqs_hw_sin", freqs_hw.sin(), persistent=False)
 
     def forward(self, x, height_width=None, extend_with_register_tokens=0):
         if height_width is not None:
@@ -348,6 +384,20 @@ class TwoDimRotary(torch.nn.Module):
             )
 
         return cos[None, :, :], sin[None, :, :]  # [1, T + N, Attn-dim]
+
+    def reset_parameters(self):
+        inv_freq = torch.FloatTensor([1.0 / (self.base ** (i / self.dim)) for i in range(0, self.dim, 2)])
+
+        t_h = torch.arange(self.h, dtype=torch.float32)
+        t_w = torch.arange(self.w, dtype=torch.float32)
+
+        freqs_h = torch.outer(t_h, inv_freq).unsqueeze(1)  # h, 1, d / 2
+        freqs_w = torch.outer(t_w, inv_freq).unsqueeze(0)  # 1, w, d / 2
+        freqs_h = freqs_h.repeat(1, self.w, 1)  # h, w, d / 2
+        freqs_w = freqs_w.repeat(self.h, 1, 1)  # h, w, d / 2
+        freqs_hw = torch.cat([freqs_h, freqs_w], 2)  # h, w, d
+        self.freqs_hw_cos[...] = freqs_hw.cos()
+        self.freqs_hw_sin[...] = freqs_hw.sin()
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -443,111 +493,32 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
         set_peft_model_state_dict(self, lora_state_dict)
 
     def reset_parameters(self):
-        """Reset all model parameters to their initial values"""
-        # Reset context projection and norm
-        if hasattr(self.context_proj, 'reset_parameters'):
-            self.context_proj.reset_parameters()
-        else:
-            nn.init.xavier_uniform_(self.context_proj.weight)
-            if self.context_proj.bias is not None:
-                nn.init.zeros_(self.context_proj.bias)
+        self.context_proj.reset_parameters()
+        nn.init.ones_(self.context_norm.weight)
         
-        # Reset patch embedding
-        if hasattr(self.patch_embed.patch_proj, 'reset_parameters'):
-            self.patch_embed.patch_proj.reset_parameters()
+        self.patch_embed.reset_parameters()
+
+        if self.config.use_rope:
+            self.rope.reset_parameters()
         else:
-            nn.init.kaiming_normal_(self.patch_embed.patch_proj.weight, mode='fan_out', nonlinearity='relu')
-            if self.patch_embed.patch_proj.bias is not None:
-                nn.init.zeros_(self.patch_embed.patch_proj.bias)
-        
-        # Reset positional embedding or rope
-        if hasattr(self, 'positional_embedding'):
             nn.init.zeros_(self.positional_embedding)
         
-        # Reset register tokens
-        nn.init.normal_(self.register_tokens, std=0.02)
+        # register tokens intialze with normal distribution
+        nn.init.normal_(self.register_tokens, mean=0.0, std=0.02)
         
-        # Reset time embedding layers
-        for module in self.time_embed:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        
-        # Reset adaLN modulation - keep the special initialization
-        for module in self.adaLN_modulation:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        # Apply the special zero initialization for the last layer
+        self.time_embed[0].reset_parameters()
+        self.time_embed[2].reset_parameters()
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
-        
-        # Reset all DiT blocks
+
         for block in self.blocks:
-            self._reset_dit_block_parameters(block)
+            block.reset_parameters()
         
-        # Reset final modulation - keep the special initialization
-        for module in self.final_modulation:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        # Apply the special zero initialization for the last layer
         nn.init.zeros_(self.final_modulation[-1].weight)
         nn.init.zeros_(self.final_modulation[-1].bias)
-        
-        # Reset final projection - keep the special initialization
         nn.init.zeros_(self.final_proj.weight)
         nn.init.zeros_(self.final_proj.bias)
-
-    def _reset_dit_block_parameters(self, block):
-        """Reset parameters for a single DiT block"""
-        # Reset self attention
-        self._reset_attention_parameters(block.self_attn)
-        
-        # Reset cross attention if it exists
-        if hasattr(block, 'cross_attn') and block.cross_attn is not None:
-            self._reset_attention_parameters(block.cross_attn)
-        
-        # Reset MLP - LigerSwiGLUMLP should handle its own reset if available
-        if hasattr(block.mlp, 'reset_parameters'):
-            block.mlp.reset_parameters()
-        else:
-            # Manual reset for MLP components if needed
-            for module in block.mlp.modules():
-                if isinstance(module, nn.Linear):
-                    nn.init.xavier_uniform_(module.weight)
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
-
-    def _reset_attention_parameters(self, attn_module):
-        """Reset parameters for an attention module"""
-        # Reset QKV or Q/KV projections
-        if hasattr(attn_module, 'qkv'):
-            nn.init.xavier_uniform_(attn_module.qkv.weight)
-            if attn_module.qkv.bias is not None:
-                nn.init.zeros_(attn_module.qkv.bias)
-        else:
-            # Cross attention case
-            nn.init.xavier_uniform_(attn_module.q.weight)
-            if attn_module.q.bias is not None:
-                nn.init.zeros_(attn_module.q.bias)
-            nn.init.xavier_uniform_(attn_module.context_kv.weight)
-            if attn_module.context_kv.bias is not None:
-                nn.init.zeros_(attn_module.context_kv.bias)
-        
-        # Reset output projection
-        nn.init.xavier_uniform_(attn_module.proj.weight)
-        if attn_module.proj.bias is not None:
-            nn.init.zeros_(attn_module.proj.bias)
-        
-        # Reset QK normalization parameters if they have trainable weights
-        if hasattr(attn_module.qk_norm.query_norm, 'weight') and attn_module.qk_norm.query_norm.weight is not None:
-            nn.init.ones_(attn_module.qk_norm.query_norm.weight)
-        if hasattr(attn_module.qk_norm.key_norm, 'weight') and attn_module.qk_norm.key_norm.weight is not None:
-            nn.init.ones_(attn_module.qk_norm.key_norm.weight)
+        self.final_norm.reset_parameters()
 
     @apply_forward_hook
     def forward(self, x, context, context_attn_mask, timesteps):
