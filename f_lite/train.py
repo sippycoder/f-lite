@@ -261,6 +261,7 @@ def create_data_loader(
         resolution=resolution,
         center_crop=center_crop,
         random_flip=random_flip,
+        caption_column=args.caption_column,
         debug=args.debug
     )
     
@@ -282,7 +283,7 @@ def create_data_loader(
             batch_size=batch_size,
             sampler=sampler,
             num_workers=num_workers,
-            prefetch_factor=2,
+            prefetch_factor=4,
             pin_memory=True,
             drop_last=True,
         )
@@ -317,7 +318,7 @@ def encode_prompt_with_qwen2_5_vl(
     num_images_per_prompt=1,
     device=None,
     return_index=-8,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     prompt = [prompt] if isinstance(prompt, str) else prompt
     batch_size = len(prompt)
 
@@ -388,11 +389,8 @@ def forward(
     # Get captions from metadata
     captions = metadatas[0]["long_caption"]
 
-    # print(captions)
-    # # ["The Cavalier King Charles Spaniel has a scruffy appearance, with a bit of white on its face and ears, and a darker brown color on its body. Its eyes are wide open and it's looking straight ahead with a slightly concerned expression. The dog is peeking out from under a vehicle, with only its face visible above the edge. The floor is a smooth, light-colored surface.", 'The sun is shining brightly over the ocean, creating lens flare effects. The sun is low in the sky, indicating it might be early morning or late afternoon. There are rocks in the foreground, and the waves gently lap against them. The water has a calm appearance with small ripples, reflecting the sunlight. The overall scene is peaceful and serene. The name "Uccio81" is visible in the top right corner.', 'The scene shows a yellow building with a brown door and a window on the left side. There is a bicycle leaning against the wall next to the window. The building has visible numbers, "357" and "361," above the door. There is a tree branch extending over the roof. The ground is a concrete sidewalk, and the street runs along the front of the building. The door is closed and appears to be wooden. The window has metal bars, and it seems to have glass panes with some reflections. The sky is clear.', "A close-up photo captures the moment a stream of honey is slowly dripping into a glass bowl. The honey has a rich, amber color, and the bowl appears to be made of glass. The honey creates ripples as it hits the surface of the water in the bowl. The liquid inside the bowl is clear, and the overall setting is illuminated by a bright light source, creating a sparkling effect. The scene is simple yet visually captivating, highlighting the honey's smooth, viscous texture. The year 2017 is visible at the bottom of the frame.", 'I see a group of animated characters walking in a line. They have distinct styles and poses. The group includes a woman with long dark hair wearing a green top and blue pants. Next to her is a man with spiky black hair in a white shirt. A man with a large brown afro and beard is wearing a red vest. Behind them, there are more characters, some holding weapons and tools. In the back, there\'s a man in a white shirt and hat. The bottom of the line is a man wearing a cap and holding a wrench. At the far right, there\'s a blue cat with a mechanical body. \n\nThey are on a road, and the text reads "walk more slowly." Above the text, there are logos and symbols, including a red cross on a white background. There is a banner with the word "NE PIECE" at the bottom of the poster.', 'The video captures a large medieval castle perched on a hill surrounded by lush greenery. The castle, made of dark brick, features several turrets with conical roofs and is enclosed by high walls. In the foreground, people can be seen walking around the castle\'s grounds, giving a sense of scale to the structure. The setting is serene, with trees and plants covering the landscape around the castle. A watermark indicating "Bejot Photography" is visible on the lower right corner.', 'The photo shows a supermarket aisle filled with an assortment of candy. There are various types of candy displayed in clear plastic containers and boxes. The shelves are well-stocked with an abundance of sweets, and some products have colorful packaging. You can see jars filled with what appears to be gummy candies in different colors and flavors, as well as boxes of other sweet treats. The overall scene is bright and inviting, showcasing a wide selection of confectionery items. ', 'A serene beach scene unfolds at sunset, where the sky is a blend of soft orange and blue hues. The sun, low on the horizon, casts a warm glow across the calm sea. A pier extends into the water, silhouetted against the glowing sky. Gentle waves lap against the sandy shore.', "A bench sits in front of a closed garage door with a turquoise background. The garage is part of a building with a white wall and a brick section on the left side. There's a patch of gravel in the foreground, and some plants are growing near the garage wall.", "I see a red shutter on a stone wall. It's closed, with metal latches. Next to it is a barred window. The shutter has a slightly weathered look. The shutter is set within a stone building. The window beside it has a grid pattern on the bars. The sunlight casts shadows on the wall.", 'The large green crane is lifting a heavy object. The crane arm is extended, and a mechanical arm with a drum is visible at the end. Cables are wrapped around the drum, ready to lift the load. The background is clear and blue.', 'A large, ancient structure with stone columns and an ornate pediment featuring intricate carvings is visible under a clear blue sky. The columns are tall, weathered, and arranged in a row. The top of the structure has a detailed entablature that displays a series of rectangular and triangular shapes, typical of classical architecture. The craftsmanship is evident in the precise design and weathered texture of the stone. The background is mostly sky, with some scattered clouds. ', 'A view from a high vantage point shows a vast, open landscape with rolling hills and lush greenery. The scene features a river winding through the valley, bordered by trees and fields. In the distance, mountains rise against the clear blue sky. The foreground has leafless branches and some sparse bushes.', 'A white cat with blue eyes is sitting on a tree stump outdoors. There are plants in the background and a plastic bottle is lying on the ground next to the cat.', 'The black and white photo captures a scene where a flock of birds perches on power lines against a backdrop of a cloudy sky and some trees. The birds are evenly distributed along the wires, with a mix of different types of birds visible. The composition creates a striking silhouette effect. The overall atmosphere is serene and peaceful.', 'A beautifully decorated room with a large Christmas tree adorned with lights and ornaments stands in the corner, surrounded by people who are setting up or adjusting decorations. The room has a warm ambiance with candles on the tables and large wreaths hanging on the walls. Tables are arranged in a U-shape with chairs placed neatly around them, and the table settings are formal, featuring gold chargers and red napkins. The floor is wooden, and the overall setting suggests preparations for a festive holiday event.']
-    
     # Process images and captions
-    preprocess_start = time.time()
+    # preprocess_start = time.time()
     images_vae = images_vae.to(device).to(torch.float32)
     
     with torch.no_grad():
@@ -421,7 +419,7 @@ def forward(
         caption_encoded = caption_encoded.repeat(batch_multiplicity, 1, 1)
         
     # Randomly zero out some caption_encoded (simulates classifier-free guidance)
-    do_zero_out = torch.rand(caption_encoded.shape[0], device=device) < 0.1
+    do_zero_out = torch.rand(caption_encoded.shape[0], device=device) < 0.05
     caption_encoded[do_zero_out] = 0
     caption_attn_mask[do_zero_out] = 1
 
@@ -454,12 +452,12 @@ def forward(
         vae_latent.shape, device=device, dtype=torch.bfloat16, generator=generator
     )
     
-    preprocess_time = time.time() - preprocess_start
-    if master_process:
-        logger.debug(f"Preprocessing took {preprocess_time*1000:.2f}ms, alpha={alpha:.2f}")
+    # preprocess_time = time.time() - preprocess_start
+    # if master_process:
+    #     logger.debug(f"Preprocessing took {preprocess_time*1000:.2f}ms, alpha={alpha:.2f}")
     
     # Forward pass through DiT
-    forward_start = time.time()
+    # forward_start = time.time()
     
     # Create noisy latents
     tr = t.reshape(batch_size, 1, 1, 1)
@@ -493,9 +491,9 @@ def forward(
             diffusion_loss_binning[tb] += diffusion_loss_batchwise[idx].item()
             diffusion_loss_binning_count[tb] += 1
     
-    forward_time = time.time() - forward_start
-    if master_process:
-        logger.debug(f"Forward pass took {forward_time*1000:.2f}ms")
+    # forward_time = time.time() - forward_start
+    # if master_process:
+    #     logger.debug(f"Forward pass took {forward_time*1000:.2f}ms")
     
     return total_loss, diffusion_loss
 
@@ -845,11 +843,20 @@ def train(args):
         except ImportError:
             logger.warning("bitsandbytes not installed, falling back to regular AdamW")
     
+    # Wrap the model in FSDP2
+    dit_model = parallelize_model(
+        model=dit_model, 
+        device_mesh=device_mesh, 
+        param_dtype=torch.bfloat16,
+        fsdp_grouping_plan=build_fsdp_grouping_plan(dit_model),
+    )
+
     optimizer = optimizer_class(
         dit_model.parameters(),
         lr=args.learning_rate,
         betas=(0.9, 0.95),
         weight_decay=args.weight_decay,
+        fused=True,
     )
     
     # Calculate number of steps
@@ -884,13 +891,6 @@ def train(args):
             num_warmup_steps=args.num_warmup_steps,
             num_training_steps=max_steps * 1000,  # Very long decay to simulate constant
         )
-    
-    dit_model = parallelize_model(
-        model=dit_model, 
-        device_mesh=device_mesh, 
-        param_dtype=torch.bfloat16,
-        fsdp_grouping_plan=build_fsdp_grouping_plan(dit_model),
-    )
 
     if args.use_lora: 
         optimizer = optimizer_class(
@@ -910,6 +910,7 @@ def train(args):
             last_training_time = checkpointer.last_training_time
             logger.info(f"Resuming from checkpoint at {last_training_time}")
             global_step = last_training_time
+            checkpoint_path = None
         else:
             logger.info(f"Resuming from checkpoint: {checkpoint_path}")
             global_step = int(checkpoint_path.split("/")[-1])
@@ -939,9 +940,16 @@ def train(args):
     dit_model.train()
 
     dataset = train_dataloader.dataset
-    print(f"Dataset size: {len(dataset)} images")
-    print(f"Dataloader batches: {len(train_dataloader)}")
-    print(f"Calculated max steps: {len(train_dataloader) * args.num_epochs // args.gradient_accumulation_steps}")
+    print(f"""\nDataset size: {len(dataset)} images
+Dataloader batches: {len(train_dataloader)}
+Calculated max steps: {len(train_dataloader) * args.num_epochs // args.gradient_accumulation_steps}
+World size: {get_world_size()}
+Local rank: {get_local_rank()}
+Global rank: {get_global_rank()}
+Is main process: {is_main_process()}
+Device mesh: {device_mesh}
+Device: {device}
+Batch size: {args.train_batch_size}\n""")
     for epoch in range(args.num_epochs):
         logger.info(f"Starting epoch {epoch+1}/{args.num_epochs}")
         
@@ -983,15 +991,15 @@ def train(args):
                     return_index=-8,
                 )
                 
-                # Backward pass
-                total_loss.backward()
-                
-                grad_norm = torch.nn.utils.clip_grad_norm_(dit_model.parameters(), args.max_grad_norm)
+            # Backward pass
+            total_loss.backward()
+            
+            grad_norm = torch.nn.utils.clip_grad_norm_(dit_model.parameters(), args.max_grad_norm)
 
-                # Update optimizer and scheduler
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+            # Update optimizer and scheduler
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
             
             # Update progress bar
             progress_bar.update(1)
