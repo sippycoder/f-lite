@@ -11,8 +11,12 @@ from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 from torch import FloatTensor
 from tqdm.auto import tqdm
-from transformers import T5EncoderModel, T5TokenizerFast
+from transformers import Qwen2_5_VLModel, Qwen2_5_VLProcessor
 
+try:
+    from liger_kernel.transformers import apply_liger_kernel_to_qwen2_5_vl
+except ImportError:
+    apply_liger_kernel_to_qwen2_5_vl = None
 
 
 logger = logging.getLogger(__name__)
@@ -49,18 +53,18 @@ class FLitePipeline(DiffusionPipeline):
 
     dit_model: torch.nn.Module
     vae: AutoencoderKL
-    text_encoder: T5EncoderModel
-    tokenizer: T5TokenizerFast
+    text_encoder: Qwen2_5_VLModel
+    processor: Qwen2_5_VLProcessor
     _progress_bar_config: Dict[str, Any]
 
     def __init__(
-        self, dit_model: torch.nn.Module, vae: AutoencoderKL, text_encoder: T5EncoderModel, tokenizer: T5TokenizerFast
+        self, dit_model: torch.nn.Module, vae: AutoencoderKL, text_encoder: Qwen2_5_VLModel, processor: Qwen2_5_VLProcessor
     ):
         super().__init__()
         # Register all modules for the pipeline
         # Access DiffusionPipeline's register_modules directly to avoid mypy error
         DiffusionPipeline.register_modules(
-            self, dit_model=dit_model, vae=vae, text_encoder=text_encoder, tokenizer=tokenizer
+            self, dit_model=dit_model, vae=vae, text_encoder=text_encoder, processor=processor
         )
 
         # Move models to channels last for better performance
@@ -71,6 +75,8 @@ class FLitePipeline(DiffusionPipeline):
             self.vae.requires_grad_(False)
         if hasattr(self.text_encoder, "requires_grad_"):
             self.text_encoder.requires_grad_(False)
+        if apply_liger_kernel_to_qwen2_5_vl is not None:
+            apply_liger_kernel_to_qwen2_5_vl(self.text_encoder)
 
         # Constants
         self.vae_scale_factor = 8
@@ -96,6 +102,27 @@ class FLitePipeline(DiffusionPipeline):
         config = {**self._progress_bar_config, **kwargs}
         return tqdm(iterable, **config)
 
+    def _convert_caption_to_messages(self, caption: str) -> str:
+        system_prompt = "You are a text-to-image generation model engineered to transform user-provided textual captions directly into high-quality, visually rich image tokens. Your core objective is to generate the best possible, highest-fidelity image that creatively interprets and expands upon the user's intent while maintaining strong semantic alignment with the original caption. You are designed for maximum visual quality, artistic flair, and implicit adherence to best practices in image generation (e.g., proper anatomy, clear focus, compelling composition), ensuring a stunning visual result from even concise descriptions."
+
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": caption},
+                ],
+            },
+        ]
+        return self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
     def encode_prompt(
         self,
         prompt: Union[str, List[str]],
@@ -109,21 +136,23 @@ class FLitePipeline(DiffusionPipeline):
         if isinstance(prompt, str):
             prompt = [prompt]
         device = device or self.text_encoder.device
+        messages = [
+            self._convert_caption_to_messages(_prompt)
+            for _prompt in prompt
+        ]
         # Text encoder forward pass
-        text_inputs = self.tokenizer(
-            prompt,
-            padding="max_length",
+        text_inputs = self.processor(
+            text=messages,
+            padding="longest",
+            pad_to_multiple_of=8,
             max_length=max_sequence_length,
             truncation=True,
             return_tensors="pt",
-        )
-        text_input_ids = text_inputs.input_ids.to(device)
-        prompt_embeds = self.text_encoder(text_input_ids, return_dict=True, output_hidden_states=True)
+        ).to(device=device, dtype=dtype)
+        
+        prompt_embeds = self.text_encoder(**text_inputs, use_cache=False, return_dict=True, output_hidden_states=True)
         prompt_embeds_tensor = prompt_embeds.hidden_states[return_index]
-        if return_index != -1:
-            prompt_embeds_tensor = self.text_encoder.encoder.final_layer_norm(prompt_embeds_tensor)
-            prompt_embeds_tensor = self.text_encoder.encoder.dropout(prompt_embeds_tensor)
-
+        
         dtype = dtype or next(self.text_encoder.parameters()).dtype
         prompt_embeds_tensor = prompt_embeds_tensor.to(dtype=dtype, device=device)
 

@@ -13,3 +13,6 @@ logs
 .vscode
 build/*
 *.egg-info
+slurm_logs/*
+samples/*
+examples/*

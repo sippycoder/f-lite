@@ -4,35 +4,50 @@ import logging
 import math
 import os
 import random
+import shutil
 import time
+import wandb
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.utils.checkpoint
-from accelerate import Accelerator
-from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, set_seed
+from torch.distributed._tensor import DTensor
+import torch.distributed.checkpoint as dcp
 from einops import rearrange
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 from PIL import Image
-from PIL.ImageOps import exif_transpose
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
+    get_wsd_schedule
 )
 
+from f_lite.checkpoint import Checkpointer
+from f_lite.data import ImageDataset
+from f_lite.distributed import get_device_mesh_hybrid_sharding, get_global_rank, get_local_rank, get_world_size, is_main_process, parallelize_model, setup_torch_distributed
 from f_lite.pipeline import FLitePipeline
 from f_lite.precomputed_utils import (
     create_precomputed_data_loader,
     forward_with_precomputed_data,
 )
+from diffusers import AutoencoderKL
+from transformers import Qwen2_5_VLModel, AutoProcessor
+from f_lite.model import DiT
+from f_lite.sampler import StatefulDistributedSampler
+from f_lite.utils import make_image_grid
+
+try:
+    from liger_kernel.transformers import apply_liger_kernel_to_qwen2_5_vl
+except ImportError:
+    apply_liger_kernel_to_qwen2_5_vl = None
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # Set up logger
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Enable TF32 for faster training (only on NVIDIA Ampere or newer GPUs)
 torch._inductor.config.coordinate_descent_tuning = True
@@ -47,8 +62,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="DiT (Diffusion Transformer) Fine-tuning Script")
     
     # Model parameters
-    parser.add_argument("--pretrained_model_path", type=str, default=None, required=True,
+    parser.add_argument("--pretrained_model_path", type=str, default=None, required=False,
                         help="Path to pretrained model")
+    parser.add_argument("--vae_path", type=str, default=None, required=False,
+                        help="Path to pretrained VAE")
+    parser.add_argument("--text_encoder_path", type=str, default=None, required=False,
+                        help="Path to pretrained text encoder")
+    parser.add_argument("--processor_path", type=str, default=None, required=False,
+                        help="Path to pretrained processor")
     parser.add_argument("--model_width", type=int, default=3072, 
                         help="Model width")
     parser.add_argument("--model_depth", type=int, default=40,
@@ -94,7 +115,7 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.01,
                         help="Weight decay coefficient")
     parser.add_argument("--lr_scheduler", type=str, default="linear",
-                        choices=["linear", "cosine", "constant"],
+                        choices=["linear", "cosine", "wsd", "constant"],
                         help="Learning rate scheduler type")
     parser.add_argument("--num_warmup_steps", type=int, default=0,
                         help="Number of warmup steps for learning rate scheduler")
@@ -138,6 +159,7 @@ def parse_args():
                         help="Enable gradient checkpointing to save memory")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                         help="Maximum gradient norm for gradient clipping")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     # Logging and evaluation parameters
     parser.add_argument("--logging_dir", type=str, default="logs",
@@ -209,111 +231,6 @@ class ResolutionBucketSampler(torch.utils.data.BatchSampler):
         else:
             return sum((len(indices) + self.batch_size - 1) // self.batch_size for indices in self.buckets.values())
 
-class DiffusionDataset(Dataset):
-    """
-    Dataset for loading images and captions for DiT fine-tuning.
-    """
-    def __init__(
-        self,
-        data_path,
-        base_image_dir=None,
-        image_column="image_path",
-        caption_column="caption",
-        resolution=512,
-        center_crop=True,
-        random_flip=False,
-        keep_aspect_ratio=True,
-    ):
-        self.resolution = resolution  # Can be None to keep native resolution
-        self.center_crop = center_crop
-        self.random_flip = random_flip
-        self.keep_aspect_ratio = keep_aspect_ratio
-        self.base_image_dir = base_image_dir
-        
-        # Load data from CSV or directory
-        self.data_entries = []
-        
-        if data_path.endswith('.csv'):
-            df = pd.read_csv(data_path)
-            for _, row in df.iterrows():
-                image_path = row[image_column]
-                if base_image_dir is not None:
-                    image_path = os.path.join(base_image_dir, image_path)
-                
-                caption = row[caption_column] if caption_column in df.columns else ""
-                self.data_entries.append({
-                    "image_path": image_path,
-                    "caption": caption
-                })
-        else:
-            # Assume it's a directory containing images
-            image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
-            for file in os.listdir(data_path):
-                if any(file.lower().endswith(ext) for ext in image_extensions):
-                    image_path = os.path.join(data_path, file)
-                    # Use filename as caption if no captions provided
-                    caption = os.path.splitext(file)[0].replace('_', ' ').replace('-', ' ')
-                    self.data_entries.append({
-                        "image_path": image_path,
-                        "caption": caption
-                    })
-                    
-        print(f"Loaded dataset with {len(self.data_entries)} entries")
-                    
-        # Image transforms
-        self.image_transforms = self._get_transforms()
-        
-    def _get_transforms(self):
-        """Define image transformations with options to skip preprocessing."""
-    
-        transform_list = []
-    
-        # Only resize if resolution is specified
-        if self.resolution is not None:
-            if self.keep_aspect_ratio:
-                # Resize maintaining aspect ratio
-                transform_list.append(transforms.Resize(
-                    self.resolution, 
-                    interpolation=transforms.InterpolationMode.BILINEAR
-                ))
-            else:
-                # Resize to exact dimensions
-                transform_list.append(transforms.Resize(
-                    (self.resolution, self.resolution), 
-                    interpolation=transforms.InterpolationMode.BILINEAR
-                ))
-
-        # Add crop only if requested
-        if self.center_crop and self.resolution is not None:
-            transform_list.append(transforms.CenterCrop(self.resolution))
-    
-        # Add flip only if requested
-        if self.random_flip:
-            transform_list.append(transforms.RandomHorizontalFlip())
-
-        # Always convert to tensor
-        transform_list.append(transforms.ToTensor())
-     
-        return transforms.Compose(transform_list)
-        
-    def __len__(self):
-        return len(self.data_entries)
-    
-    def __getitem__(self, index):
-        entry = self.data_entries[index]
-        
-        # Load and preprocess image
-        image = Image.open(entry["image_path"]).convert("RGB")
-        image = exif_transpose(image)  # Handle EXIF orientation
-        image_tensor = self.image_transforms(image)
-        
-        # Return image and metadata
-        return (
-            image_tensor,
-            [{
-                "long_caption": entry["caption"],
-            }]
-        )
 
 def create_data_loader(
     data_path,
@@ -326,6 +243,8 @@ def create_data_loader(
     center_crop=False,
     random_flip=False,
     use_resolution_buckets=True,
+    num_processes=1,
+    process_index=0,
 ):
     # Set seed for reproducibility if provided
     if seed is not None:
@@ -336,12 +255,14 @@ def create_data_loader(
             torch.cuda.manual_seed_all(seed)
     
     # Create dataset
-    dataset = DiffusionDataset(
+    dataset = ImageDataset(
         data_path=data_path,
         base_image_dir=base_image_dir,
         resolution=resolution,
         center_crop=center_crop,
         random_flip=random_flip,
+        caption_column=args.caption_column,
+        debug=args.debug
     )
     
     # Create sampler - either resolution bucket or standard
@@ -355,72 +276,85 @@ def create_data_loader(
         )
     else:
         # Standard approach
-        if shuffle:
-            sampler = torch.utils.data.RandomSampler(dataset)
-        else:
-            sampler = torch.utils.data.SequentialSampler(dataset)
+        sampler = StatefulDistributedSampler(dataset, batch_size=batch_size, num_replicas=num_processes, rank=process_index, shuffle=shuffle)
         
         data_loader = DataLoader(
             dataset,
             batch_size=batch_size,
             sampler=sampler,
             num_workers=num_workers,
+            prefetch_factor=4,
             pin_memory=True,
             drop_last=True,
         )
     
     return data_loader
 
-def encode_prompt_with_t5(
+def _convert_caption_to_messages(caption: str, processor: AutoProcessor) -> str:
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a text-to-image generation model engineered to transform user-provided textual captions directly into high-quality, visually rich image tokens. Your core objective is to generate the best possible, highest-fidelity image that creatively interprets and expands upon the user's intent while maintaining strong semantic alignment with the original caption. You are designed for maximum visual quality, artistic flair, and implicit adherence to best practices in image generation (e.g., proper anatomy, clear focus, compelling composition), ensuring a stunning visual result from even concise descriptions.",
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": caption},
+            ],
+        },
+    ]
+    return processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+@torch.no_grad()
+def encode_prompt_with_qwen2_5_vl(
     text_encoder,
-    tokenizer,
+    processor,
     max_sequence_length=512,
     prompt=None,
     num_images_per_prompt=1,
     device=None,
-    text_input_ids=None,
-    return_index=-1,
-):
+    return_index=-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
     prompt = [prompt] if isinstance(prompt, str) else prompt
     batch_size = len(prompt)
 
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
+    messages = [_convert_caption_to_messages(p, processor) for p in prompt]
+
+    inputs = processor(
+        text=messages,
+        padding="longest",
+        pad_to_multiple_of=8,
         max_length=max_sequence_length,
         truncation=True,
-        return_length=False,
-        return_overflowing_tokens=False,
+        return_attention_mask=True,
         return_tensors="pt",
-    )
-    text_input_ids = text_inputs.input_ids
+    ).to(device=device, dtype=text_encoder.dtype)
+    attn_mask = inputs.attention_mask
 
-    prompt_embeds = text_encoder(
-        text_input_ids.to(device), return_dict=True, output_hidden_states=True
-    )
+    outputs = text_encoder(**inputs, use_cache=False, return_dict=True, output_hidden_states=True)
+    prompt_embeds = outputs.hidden_states[return_index]
 
-    prompt_embeds = prompt_embeds.hidden_states[return_index]
-    if return_index != -1:
-        prompt_embeds = text_encoder.encoder.final_layer_norm(prompt_embeds)
-        prompt_embeds = text_encoder.encoder.dropout(prompt_embeds)
-
-    dtype = text_encoder.dtype
-    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+    prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
 
     _, seq_len, _ = prompt_embeds.shape
 
-    # duplicate text embeddings and attention mask for each generation per prompt
-    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+    if num_images_per_prompt > 1:
+        # duplicate text embeddings and attention mask for each generation per prompt
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
-    return prompt_embeds
+    return prompt_embeds, attn_mask
 
 def forward(
     dit_model,
     batch,
     vae_model,
     text_encoder,
-    tokenizer,
+    processor,
     device,
     global_step,
     master_process,
@@ -429,7 +363,7 @@ def forward(
     batch_multiplicity=None,
     bs_rampup=None,
     batch_size=None,
-    return_index=-1,
+    return_index=-8,
 ):
     """
     Forward pass for DiT model.
@@ -452,13 +386,11 @@ def forward(
     """
     (images_vae, metadatas) = batch
 
-    images_vae.sub_(0.5).mul_(2.0)  # Normalize to [-1, 1]
-    
     # Get captions from metadata
-    captions = [metadata["long_caption"][0] for metadata in metadatas]
-    
+    captions = metadatas[0]["long_caption"]
+
     # Process images and captions
-    preprocess_start = time.time()
+    # preprocess_start = time.time()
     images_vae = images_vae.to(device).to(torch.float32)
     
     with torch.no_grad():
@@ -471,9 +403,9 @@ def forward(
         vae_latent = vae_latent.to(torch.bfloat16)
         
         # Encode captions
-        caption_encoded = encode_prompt_with_t5(
+        caption_encoded, caption_attn_mask = encode_prompt_with_qwen2_5_vl(
             text_encoder,
-            tokenizer,
+            processor,
             prompt=captions,
             device=device,
             return_index=return_index,
@@ -486,10 +418,11 @@ def forward(
         vae_latent = vae_latent.repeat(batch_multiplicity, 1, 1, 1)
         caption_encoded = caption_encoded.repeat(batch_multiplicity, 1, 1)
         
-        # Randomly zero out some caption_encoded (simulates classifier-free guidance)
-        do_zero_out = torch.rand(caption_encoded.shape[0], device=device) < 0.01
-        caption_encoded[do_zero_out] = 0
-    
+    # Randomly zero out some caption_encoded (simulates classifier-free guidance)
+    do_zero_out = torch.rand(caption_encoded.shape[0], device=device) < 0.05
+    caption_encoded[do_zero_out] = 0
+    caption_attn_mask[do_zero_out] = 1
+
     # Batch size rampup - gradually increase batch size during training
     if bs_rampup is not None and global_step < bs_rampup:
         target_bs = math.ceil((global_step + 1) * batch_size / bs_rampup / 4) * 4  # Round to multiple of 4
@@ -519,12 +452,12 @@ def forward(
         vae_latent.shape, device=device, dtype=torch.bfloat16, generator=generator
     )
     
-    preprocess_time = time.time() - preprocess_start
-    if master_process:
-        logger.debug(f"Preprocessing took {preprocess_time*1000:.2f}ms, alpha={alpha:.2f}")
+    # preprocess_time = time.time() - preprocess_start
+    # if master_process:
+    #     logger.debug(f"Preprocessing took {preprocess_time*1000:.2f}ms, alpha={alpha:.2f}")
     
     # Forward pass through DiT
-    forward_start = time.time()
+    # forward_start = time.time()
     
     # Create noisy latents
     tr = t.reshape(batch_size, 1, 1, 1)
@@ -534,7 +467,7 @@ def forward(
     v_objective = vae_latent - noise
      
     # Forward through model
-    output = dit_model(z_t, caption_encoded, t)
+    output = dit_model(z_t, caption_encoded, caption_attn_mask, t)
     
     targ = rearrange(v_objective, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=2, p2=2)
     pred = rearrange(output, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=2, p2=2)
@@ -558,9 +491,9 @@ def forward(
             diffusion_loss_binning[tb] += diffusion_loss_batchwise[idx].item()
             diffusion_loss_binning_count[tb] += 1
     
-    forward_time = time.time() - forward_start
-    if master_process:
-        logger.debug(f"Forward pass took {forward_time*1000:.2f}ms")
+    # forward_time = time.time() - forward_start
+    # if master_process:
+    #     logger.debug(f"Forward pass took {forward_time*1000:.2f}ms")
     
     return total_loss, diffusion_loss
 
@@ -568,7 +501,7 @@ def sample_images(
     dit_model,
     vae_model,
     text_encoder,
-    tokenizer,
+    processor,
     device,
     global_step,
     prompts=None,
@@ -607,24 +540,25 @@ def sample_images(
     previous_training_state = dit_model.training
     dit_model.eval()
     
-    # Create output directory for samples
-    samples_dir = os.path.join(os.getcwd(), "samples")
-    os.makedirs(samples_dir, exist_ok=True)
-    
+    samples = []
+
     # Generate samples with correct sampling logic
     with torch.no_grad():
         for i, prompt in enumerate(prompts):
             # Encode prompt
-            prompt_embeds = encode_prompt_with_t5(
+            prompt_embeds, prompt_attn_mask = encode_prompt_with_qwen2_5_vl(
                 text_encoder,
-                tokenizer,
+                processor,
                 prompt=[prompt],
                 device=device,
                 return_index=return_index,
-            ).to(torch.bfloat16)
+            )
+            prompt_embeds = prompt_embeds.to(torch.bfloat16)
+            prompt_attn_mask = prompt_attn_mask.to(torch.bfloat16)
             
             # Create unconditional embeddings for CFG
             negative_embeds = torch.zeros_like(prompt_embeds)
+            negative_attn_mask = torch.ones_like(prompt_attn_mask)
             
             # Initialize latents with correct channel count (16)
             batch_size = 1
@@ -632,8 +566,8 @@ def sample_images(
             
             latent_height = image_height // 8
             latent_width = image_width // 8
-            latent_shape = (batch_size, 16, latent_height, latent_width)  # 16 channels not 4
-            latents = torch.randn(latent_shape, device=device, generator=generator, dtype=torch.float32)
+            latent_shape = (batch_size, vae_model.config.latent_channels, latent_height, latent_width)
+            latents = torch.randn(latent_shape, device=device, generator=generator, dtype=torch.bfloat16)
             
             # Setup timesteps with proper scaling
             image_token_size = latent_height * latent_width
@@ -653,11 +587,11 @@ def sample_images(
                 t_tensor = torch.tensor([t] * batch_size).to(device, torch.bfloat16)
                 
                 # Get model prediction
-                model_output = dit_model(latents.to(torch.bfloat16), prompt_embeds, t_tensor)
+                model_output = dit_model(latents.to(torch.bfloat16), prompt_embeds, prompt_attn_mask, t_tensor)
                 
                 # Apply classifier-free guidance
                 if cfg_scale > 1:
-                    uncond_output = dit_model(latents.to(torch.bfloat16), negative_embeds, t_tensor)
+                    uncond_output = dit_model(latents.to(torch.bfloat16), negative_embeds, negative_attn_mask, t_tensor)
                     model_output = uncond_output + cfg_scale * (model_output - uncond_output)
                 
                 # Update latents with simple velocity update
@@ -668,26 +602,22 @@ def sample_images(
             image = vae_model.decode(latents.to(torch.float32)).sample
             
             # Post-process images
-            image = (image
-                .mul(127.5)  # Scale from [-1, 1] to [-127.5, 127.5]
-                .add(127.5)  # Shift from [-127.5, 127.5] to [0, 255]
-                .clamp(0, 255)
-                .to(torch.uint8)
-                .permute(0, 2, 3, 1)  # NCHW -> NHWC
-                .cpu()
-                .numpy()[0]  # Extract first batch item
-            )
-            
-            # Convert to PIL and save
-            pil_image = Image.fromarray(image)
-            prompt_slug = prompt[:40].replace(" ", "_").replace(".", "").replace(",", "")
-            image_path = os.path.join(samples_dir, f"sample_{global_step}_{i}_{prompt_slug}.png")
-            pil_image.save(image_path)
-             
+            # VAE output is in [-1, 1] range. `save_image` with `normalize=True` will handle conversion.
+            # The previous code was incorrectly converting to uint8 and permuting dimensions.
+            samples.append(image.cpu()[0])
+
+    image_grid = make_image_grid(samples, nrow=3, normalize=True, value_range=(-1, 1))
+    
     # Restore original training state
     dit_model.train(previous_training_state)
     
-    logger.info(f"Generated samples saved to {samples_dir}")
+    return image_grid
+
+
+def build_fsdp_grouping_plan(model: DiT):
+    group_plan = [(block, False) for block in model.blocks]
+    return group_plan
+
 
 def train(args):
     """
@@ -696,76 +626,89 @@ def train(args):
     Args:
         args: Script arguments
     """
-    # Initialize accelerator
-    logging_dir = os.path.join(args.output_dir, args.logging_dir)
-    project_config = ProjectConfiguration(
-        project_dir=args.output_dir,
-        logging_dir=logging_dir,
-    )
-    
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
-        project_config=project_config,
-    )
+    setup_torch_distributed()
+    device_mesh = get_device_mesh_hybrid_sharding()
+    world_size = get_world_size()
+    global_rank = get_global_rank()
+    local_rank = get_local_rank()
+    device = f"cuda:{local_rank}"
     
     # Setup logging
+    log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
+        level=log_level,
     )
     
     # Set logger level for various components
-    if accelerator.is_main_process:
+    if is_main_process():
         transformers_logger = logging.getLogger("transformers")
         transformers_logger.setLevel(logging.WARNING)
     
-    logger.info(accelerator.state, main_process_only=False)
-    
-    # Determine device
-    device = accelerator.device
-    
     # Set random seed for reproducibility
     if args.seed is not None:
-        set_seed(args.seed)
+        random.seed(args.seed)
+        np.random.seed(args.seed)
         # Create a common seed for data loading
         common_seed = args.seed
     else:
         common_seed = random.randint(0, 1000000)
     
     logger.info(f"Using random seed: {common_seed}")
+
+    torch.manual_seed(common_seed)
     
     # Initialize wandb if needed
-    if accelerator.is_main_process and args.report_to in ["wandb", "all"]:
-        import wandb
-        
-        run_name = args.run_name if args.run_name else f"DiT-finetune-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
-        
+    if args.report_to in ["wandb", "all"] and is_main_process():
+        run_name = args.run_name if args.run_name else f"DiT-pretrain-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
         wandb.init(
             project=args.project_name,
             name=run_name,
             config=vars(args),
         )
-     
-    logger.info(f"Loading model from {args.pretrained_model_path}")
-    pipeline = FLitePipeline.from_pretrained(
-        args.pretrained_model_path,
-        torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else None
-    )
+    
+    if args.pretrained_model_path is not None:
+        logger.info(f"Loading model from {args.pretrained_model_path}")
+        pipeline = FLitePipeline.from_pretrained(
+            args.pretrained_model_path,
+            torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else None
+        )
+    else:
+        vae = AutoencoderKL.from_pretrained(args.vae_path)
+        text_encoder = Qwen2_5_VLModel.from_pretrained(args.text_encoder_path, torch_dtype=torch.bfloat16)
+        if apply_liger_kernel_to_qwen2_5_vl is not None:
+            apply_liger_kernel_to_qwen2_5_vl(text_encoder)
+        processor = AutoProcessor.from_pretrained(args.processor_path)
+        dit_model = DiT(
+            in_channels=vae.config.latent_channels,
+            patch_size=2,
+            hidden_size=args.model_width,
+            depth=args.model_depth,
+            num_heads=args.model_width // args.model_head_dim,
+            mlp_ratio=4.0,
+            cross_attn_input_size=text_encoder.config.hidden_size,
+            train_bias_and_rms=True,
+            use_rope=True,
+            gradient_checkpoint=args.gradient_checkpointing,
+            dynamic_softmax_temperature=False,
+            rope_base=args.rope_base,
+        )
+        pipeline = FLitePipeline(
+            dit_model=dit_model,
+            vae=vae,
+            text_encoder=text_encoder,
+            processor=processor)
 
     # Load only the models needed based on precomputed status
     if args.use_precomputed_data:
         # Only load DiT model if using precomputed data
         dit_model = pipeline.dit_model
-        dit_model.to(torch.bfloat16)
-        dit_model.to(device)
-
+        
         # Set VAE and text_encoder to None to save memory
         vae_model = None
         text_encoder = None
-        tokenizer = None
+        processor = None
 
         logger.info("Using precomputed data - VAE and text encoder not loaded to save memory")
     else:
@@ -773,17 +716,18 @@ def train(args):
         dit_model = pipeline.dit_model
         vae_model = pipeline.vae
         text_encoder = pipeline.text_encoder
-        tokenizer = pipeline.tokenizer
+        processor = pipeline.processor
 
         # Move models to device
-        dit_model = dit_model.to(torch.bfloat16)
-        dit_model = dit_model.to(device)
         vae_model = vae_model.to(device)
         text_encoder = text_encoder.to(device)
 
         # Freeze encoders (they are only used for inference)
         vae_model.requires_grad_(False)
         text_encoder.requires_grad_(False)
+
+        logger.info("Compiling VAE...")
+        vae_model = torch.compile(vae_model, mode='reduce-overhead')
     
     dit_model.train() 
     
@@ -873,6 +817,8 @@ def train(args):
             center_crop=args.center_crop,
             random_flip=args.random_flip,
             use_resolution_buckets=args.use_resolution_buckets,
+            num_processes=world_size,
+            process_index=global_rank,
         )
 
         val_dataloader = None
@@ -883,6 +829,8 @@ def train(args):
                 base_image_dir=args.base_image_dir,
                 shuffle=False,
                 num_workers=4,
+                num_processes=world_size,
+                process_index=global_rank,
             )
     
     # Initialize optimizer
@@ -895,11 +843,20 @@ def train(args):
         except ImportError:
             logger.warning("bitsandbytes not installed, falling back to regular AdamW")
     
+    # Wrap the model in FSDP2
+    dit_model = parallelize_model(
+        model=dit_model, 
+        device_mesh=device_mesh, 
+        param_dtype=torch.bfloat16,
+        fsdp_grouping_plan=build_fsdp_grouping_plan(dit_model),
+    )
+
     optimizer = optimizer_class(
         dit_model.parameters(),
         lr=args.learning_rate,
         betas=(0.9, 0.95),
         weight_decay=args.weight_decay,
+        fused=True,
     )
     
     # Calculate number of steps
@@ -921,17 +878,19 @@ def train(args):
             num_warmup_steps=args.num_warmup_steps,
             num_training_steps=max_steps,
         )
+    elif args.lr_scheduler == "wsd":
+        lr_scheduler = get_wsd_schedule(
+            optimizer=optimizer,
+            num_warmup_steps=args.num_warmup_steps,
+            num_decay_steps=max_steps // 10,  # 10% of the training steps for decay
+            num_stable_steps=max_steps - args.num_warmup_steps - max_steps // 10,  # 90% of the training steps for stable
+        )
     else:  # constant with warmup
         lr_scheduler = get_linear_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=args.num_warmup_steps,
             num_training_steps=max_steps * 1000,  # Very long decay to simulate constant
         )
-    
-    # Prepare with accelerator
-    dit_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        dit_model, optimizer, train_dataloader, lr_scheduler
-    )
 
     if args.use_lora: 
         optimizer = optimizer_class(
@@ -940,71 +899,39 @@ def train(args):
             betas=(0.9, 0.95),
             weight_decay=args.weight_decay,
         )
-        optimizer = accelerator.prepare(optimizer)
     
-    if val_dataloader:
-        val_dataloader = accelerator.prepare(val_dataloader)
-    
-    if args.resume_from_checkpoint:
+    os.makedirs(args.output_dir, exist_ok=True)
+    checkpointer = Checkpointer(args.output_dir, dcp_api=True)
+    if args.resume_from_checkpoint and checkpointer.last_training_time:
         checkpoint_path = args.resume_from_checkpoint
+        last_training_time = None
         
         if checkpoint_path == "latest":
-            dirs = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")]
-            if len(dirs) > 0:
-                dirs.sort(key=lambda d: int(d.split("-")[1]))
-                checkpoint_path = os.path.join(args.output_dir, dirs[-1])
-            else:
-                checkpoint_path = None
-        
-        if checkpoint_path:
-            logger.info(f"Resuming from checkpoint: {checkpoint_path}")
-    
-            if os.path.isdir(checkpoint_path) and not os.path.exists(os.path.join(checkpoint_path, "optimizer.pt")):
-                # This handles loading just the model weights without optimizer state
-                pipeline = FLitePipeline.from_pretrained(
-                    checkpoint_path,
-                    torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else None
-                )
-    
-                dit_model = pipeline.dit_model.to(device)
-    
-                # Load LoRA weights if using LoRA and checkpoint contains them
-                if args.use_lora and os.path.exists(os.path.join(checkpoint_path, "lora_weights.pt")):
-                    logger.info(f"Loading LoRA weights from {checkpoint_path}/lora_weights.pt")
-                    lora_state_dict = torch.load(os.path.join(checkpoint_path, "lora_weights.pt"), map_location=device)
-                    set_peft_model_state_dict(dit_model, lora_state_dict)
-    
-                dit_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                    dit_model, optimizer, train_dataloader, lr_scheduler
-                )
-                
-                # Extract step number from checkpoint path
-                global_step = int(checkpoint_path.split("-")[-1])
-                resume_step = global_step
-            else:
-                # This uses accelerator's state loading which includes optimizer state
-                accelerator.load_state(checkpoint_path)
-                
-                # Extract step number from checkpoint path
-                global_step = int(checkpoint_path.split("-")[-1])
-                resume_step = global_step
+            last_training_time = checkpointer.last_training_time
+            logger.info(f"Resuming from checkpoint at {last_training_time}")
+            global_step = last_training_time
+            checkpoint_path = None
         else:
-            logger.info("No checkpoint found, starting from scratch")
-            global_step = 0
-            resume_step = 0
+            logger.info(f"Resuming from checkpoint: {checkpoint_path}")
+            global_step = int(checkpoint_path.split("/")[-1])
+    
+        checkpointer.load_model(dit_model, last_training_time, checkpoint_path)
+        checkpointer.load_optim(dit_model, optimizer, last_training_time, checkpoint_path)
+        checkpointer.load_sampler_state(train_dataloader.sampler, last_training_time, checkpoint_path)
     else:
-        logger.info("No checkpoint specified, starting from scratch")
+        logger.info("No checkpoint found, starting from scratch")
         global_step = 0
-        resume_step = 0
-
+        dit_model.to_empty(device=device)
+        dit_model.reset_parameters()
     
     # Initialize training progress bar
     progress_bar = tqdm(
-        range(global_step, max_steps),
-        disable=not accelerator.is_main_process,
+        total=max_steps,
+        initial=global_step,
+        disable=not is_main_process(),
         desc="Training",
     )
-    
+
     # Binning for loss analysis
     diffusion_loss_binning = {k: 0 for k in range(10)}
     diffusion_loss_binning_count = {k: 0 for k in range(10)}
@@ -1013,9 +940,16 @@ def train(args):
     dit_model.train()
 
     dataset = train_dataloader.dataset
-    print(f"Dataset size: {len(dataset)} images")
-    print(f"Dataloader batches: {len(train_dataloader)}")
-    print(f"Calculated max steps: {len(train_dataloader) * args.num_epochs // args.gradient_accumulation_steps}")
+    print(f"""\nDataset size: {len(dataset)} images
+Dataloader batches: {len(train_dataloader)}
+Calculated max steps: {len(train_dataloader) * args.num_epochs // args.gradient_accumulation_steps}
+World size: {get_world_size()}
+Local rank: {get_local_rank()}
+Global rank: {get_global_rank()}
+Is main process: {is_main_process()}
+Device mesh: {device_mesh}
+Device: {device}
+Batch size: {args.train_batch_size}\n""")
     for epoch in range(args.num_epochs):
         logger.info(f"Starting epoch {epoch+1}/{args.num_epochs}")
         
@@ -1026,181 +960,231 @@ def train(args):
         # Track time
         epoch_start_time = time.time()
         
-        for step, batch in enumerate(train_dataloader):
-            # Skip steps when resuming from checkpoint
-            if resume_step > 0 and global_step < resume_step:
-                global_step += 1
-                progress_bar.update(1)
-                continue
+        for step, batch in enumerate(train_dataloader):    
+            # Forward pass
+            if args.use_precomputed_data:
+                total_loss, diffusion_loss = forward_with_precomputed_data(
+                    dit_model=dit_model,
+                    batch=batch,
+                    device=device,
+                    global_step=global_step,
+                    master_process=is_main_process(),
+                    binnings=(diffusion_loss_binning, diffusion_loss_binning_count),
+                    batch_multiplicity=args.batch_multiplicity,
+                    bs_rampup=None,
+                    batch_size=args.train_batch_size,
+                )
+            else:
+                total_loss, diffusion_loss = forward(
+                    dit_model=dit_model,
+                    batch=batch,
+                    vae_model=vae_model,
+                    text_encoder=text_encoder,
+                    processor=processor,
+                    device=device,
+                    global_step=global_step,
+                    master_process=is_main_process(),
+                    binnings=(diffusion_loss_binning, diffusion_loss_binning_count),
+                    batch_multiplicity=args.batch_multiplicity,
+                    bs_rampup=None,
+                    batch_size=args.train_batch_size,
+                    return_index=-8,
+                )
+                
+            # Backward pass
+            total_loss.backward()
             
-            with accelerator.accumulate(dit_model):
-                # Forward pass
-                if args.use_precomputed_data:
-                    total_loss, diffusion_loss = forward_with_precomputed_data(
-                        dit_model=dit_model,
-                        batch=batch,
-                        device=device,
-                        global_step=global_step,
-                        master_process=accelerator.is_main_process,
-                        binnings=(diffusion_loss_binning, diffusion_loss_binning_count),
-                        batch_multiplicity=args.batch_multiplicity,
-                        bs_rampup=None,  # We let accelerate handle this
-                        batch_size=args.train_batch_size,
-                    )
-                else:
-                    total_loss, diffusion_loss = forward(
-                        dit_model=dit_model,
-                        batch=batch,
-                        vae_model=vae_model,
-                        text_encoder=text_encoder,
-                        tokenizer=tokenizer,
-                        device=device,
-                        global_step=global_step,
-                        master_process=accelerator.is_main_process,
-                        binnings=(diffusion_loss_binning, diffusion_loss_binning_count),
-                        batch_multiplicity=args.batch_multiplicity,
-                        bs_rampup=None,  # We let accelerate handle this
-                        batch_size=args.train_batch_size,
-                        return_index=-8,
-                    )
-                
-                # Backward pass
-                accelerator.backward(total_loss)
-                
-                # Clip gradients
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(dit_model.parameters(), args.max_grad_norm)
-                
-                # Update optimizer and scheduler
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+            grad_norm = torch.nn.utils.clip_grad_norm_(dit_model.parameters(), args.max_grad_norm)
+
+            # Update optimizer and scheduler
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
             
             # Update progress bar
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
-                
-                # Logging
-                if global_step % 10 == 0 and accelerator.is_main_process:
-                    logs = {
-                        "train/loss": total_loss.item(),
-                        "train/diffusion_loss": diffusion_loss.item(),
-                        "train/lr": lr_scheduler.get_last_lr()[0],
-                        "train/epoch": epoch,
-                        "train/step": global_step,
-                    }
-                     
-                    # Log to all trackers
-                    accelerator.log(logs, step=global_step)
-                    
-                    # Update progress bar
-                    progress_bar.set_postfix({
-                        "loss": f"{total_loss.item():.4f}",
-                        "diff_loss": f"{diffusion_loss.item():.4f}",
-                        "lr": f"{lr_scheduler.get_last_lr()[0]:.7f}",
-                    }) 
-                
-                # Sample images
-                if global_step % args.sample_every == 0 and accelerator.is_main_process:
-                    # For sampling, we need VAE and text encoder
-                    temp_vae = None
-                    temp_text_encoder = None
-                    temp_tokenizer = None
-    
-                    if args.use_precomputed_data:
-                        # Temporarily load VAE and text encoder for sampling
-                        logger.info("Temporarily loading VAE and text encoder for sampling")
-                        temp_pipeline = FLitePipeline.from_pretrained(
-                            args.pretrained_model_path,
-                            torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else None
-                        )
-                        temp_vae = temp_pipeline.vae.to(device)
-                        temp_text_encoder = temp_pipeline.text_encoder.to(device)
-                        temp_tokenizer = temp_pipeline.tokenizer
+            progress_bar.update(1)
+            global_step += 1
+            
+            # Logging
+            if global_step % 10 == 0:
+                logs = {
+                    "train/loss": total_loss.item(),
+                    "train/diffusion_loss": diffusion_loss.item(),
+                    "train/lr": lr_scheduler.get_last_lr()[0],
+                    "train/epoch": epoch,
+                    "train/step": global_step,
+                }
 
-                        # Use temporary models for sampling
-                        sample_images(
-                            dit_model=accelerator.unwrap_model(dit_model),
-                            vae_model=temp_vae,
-                            text_encoder=temp_text_encoder,
-                            tokenizer=temp_tokenizer,
-                            device=device,
-                            global_step=global_step,
-                            prompts=None,  # Use default prompts as fallback
-                            image_width=1024,
-                            image_height=1024,
-                            prompts_per_gpu=2,
-                            prompts_file=args.sample_prompts_file,
-                        )
+                if grad_norm is not None:
+                    logs["train/grad_norm"] = (
+                        grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else grad_norm
+                    ).item()
 
-                        # Clean up temporary models
-                        del temp_vae, temp_text_encoder, temp_tokenizer, temp_pipeline
-                        torch.cuda.empty_cache()
-                    else:
-                        # Use existing models
-                        sample_images(
-                            dit_model=accelerator.unwrap_model(dit_model),
+                # Log average bin loss
+                for i in range(10):
+                    if diffusion_loss_binning_count[i] > 0:
+                        avg_bin_loss = (
+                            diffusion_loss_binning[i]
+                            / diffusion_loss_binning_count[i]
+                        )
+                        logs[f"metrics/avg_loss_bin_{i}"] = avg_bin_loss
+                
+                # Log bin counts as a histogram
+                if any(diffusion_loss_binning_count.values()) and is_main_process():
+                    raw_data = []
+                    for bin_idx, count in diffusion_loss_binning_count.items():
+                        raw_data.extend([bin_idx] * int(count))
+                    wandb.log(
+                        {"metrics/diffusion_loss_bin_counts": wandb.Histogram(raw_data)},
+                        step=global_step,
+                    )
+
+                # Reset binning stats for next logging interval
+                diffusion_loss_binning.clear()
+                diffusion_loss_binning.update({k: 0 for k in range(10)})
+                diffusion_loss_binning_count.clear()
+                diffusion_loss_binning_count.update({k: 0 for k in range(10)})
+                
+                # Log to all trackers
+                if is_main_process():
+                    wandb.log(logs, step=global_step)
+                
+                # Update progress bar
+                progress_bar.set_postfix({
+                    "loss": f"{total_loss.item():.4f}",
+                    "diff_loss": f"{diffusion_loss.item():.4f}",
+                    "lr": f"{lr_scheduler.get_last_lr()[0]:.7f}",
+                }) 
+            
+            # Save checkpoint
+            if global_step % args.checkpointing_steps == 0:
+                checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
+                if is_main_process():
+                    logger.info(f"Saved checkpoint to {args.output_dir}/dcp_api/{global_step}")
+
+                    # Remove old checkpoints
+                    if args.checkpoints_total_limit is not None:
+                        checkpoints = [
+                            d
+                            for d in os.listdir(args.output_dir)
+                            if os.path.isdir(os.path.join(args.output_dir, d))
+                        ]
+                        # Sort by step number (ascending)
+                        checkpoints.sort(key=lambda x: int(x))
+
+                        if len(checkpoints) > args.checkpoints_total_limit:
+                            num_to_delete = len(checkpoints) - args.checkpoints_total_limit
+                            for ckpt_to_delete in checkpoints[:num_to_delete]:
+                                shutil.rmtree(os.path.join(args.output_dir, ckpt_to_delete))
+                                logger.info(f"Removed old checkpoint: {ckpt_to_delete}")
+
+            # Sample images
+            if global_step % args.sample_every == 0:
+                # For sampling, we need VAE and text encoder
+                temp_vae = None
+                temp_text_encoder = None
+                temp_tokenizer = None
+
+                if args.use_precomputed_data:
+                    # Temporarily load VAE and text encoder for sampling
+                    logger.info("Temporarily loading VAE and text encoder for sampling")
+                    temp_pipeline = FLitePipeline.from_pretrained(
+                        args.pretrained_model_path,
+                        torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else None
+                    )
+                    temp_vae = temp_pipeline.vae.to(device)
+                    temp_text_encoder = temp_pipeline.text_encoder.to(device)
+                    temp_tokenizer = temp_pipeline.tokenizer
+
+                    # Use temporary models for sampling
+                    image_grid = sample_images(
+                        dit_model=dit_model,
+                        vae_model=temp_vae,
+                        text_encoder=temp_text_encoder,
+                        tokenizer=temp_tokenizer,
+                        device=device,
+                        global_step=global_step,
+                        prompts=None,  # Use default prompts as fallback
+                        image_width=256,
+                        image_height=256,
+                        prompts_per_gpu=2,
+                        prompts_file=args.sample_prompts_file,
+                    )
+
+                    # Clean up temporary models
+                    del temp_vae, temp_text_encoder, temp_tokenizer, temp_pipeline
+                    torch.cuda.empty_cache()
+                else:
+                    # Use existing models
+                    image_grid = sample_images(
+                        dit_model=dit_model,
+                        vae_model=vae_model,
+                        text_encoder=text_encoder,
+                        processor=processor,
+                        device=device,
+                        global_step=global_step,
+                        prompts=None,  # Use default prompts as fallback
+                        image_width=256,
+                        image_height=256,
+                        prompts_per_gpu=2,
+                        prompts_file=args.sample_prompts_file,
+                    )
+            
+                # Save image grid to wandb
+                if is_main_process():
+                    wandb.log({
+                        "samples": [wandb.Image(image_grid, caption=f"Step {global_step}")],
+                    }, step=global_step)
+            
+            # Run evaluation
+            if val_dataloader and global_step % args.eval_every == 0:
+                logger.info(f"Running evaluation at step {global_step}")
+                dit_model.eval()
+                
+                val_loss = 0.0
+                val_diffusion_loss = 0.0
+                val_count = 0
+                
+                # Evaluate on validation set
+                for val_step, val_batch in enumerate(val_dataloader):
+                    with torch.no_grad():
+                        val_total_loss, val_diff_loss = forward(
+                            dit_model=dit_model,
+                            batch=val_batch,
                             vae_model=vae_model,
                             text_encoder=text_encoder,
-                            tokenizer=tokenizer,
+                            processor=processor,
                             device=device,
                             global_step=global_step,
-                            prompts=None,  # Use default prompts as fallback
-                            image_width=1024,
-                            image_height=1024,
-                            prompts_per_gpu=2,
-                            prompts_file=args.sample_prompts_file,
+                            master_process=is_main_process(),
+                            return_index=-8,
                         )
-                
-                # Run evaluation
-                if val_dataloader and global_step % args.eval_every == 0:
-                    logger.info(f"Running evaluation at step {global_step}")
-                    dit_model.eval()
-                    
-                    val_loss = 0.0
-                    val_diffusion_loss = 0.0
-                    val_count = 0
-                    
-                    # Evaluate on validation set
-                    for val_step, val_batch in enumerate(val_dataloader):
-                        with torch.no_grad():
-                            val_total_loss, val_diff_loss = forward(
-                                dit_model=dit_model,
-                                batch=val_batch,
-                                vae_model=vae_model,
-                                text_encoder=text_encoder,
-                                tokenizer=tokenizer,
-                                device=device,
-                                global_step=global_step,
-                                master_process=accelerator.is_main_process,
-                            )
-                            
-                            val_loss += val_total_loss.item()
-                            val_diffusion_loss += val_diff_loss.item()
-                            val_count += 1
-                            
-                            # Limit validation to 20 batches
-                            if val_step >= 19:
-                                break
-                    
-                    # Calculate average validation loss
-                    if val_count > 0:
-                        val_loss /= val_count
-                        val_diffusion_loss /= val_count
                         
-                        # Log validation results
-                        if accelerator.is_main_process:
-                            logs = {
-                                "val/loss": val_loss,
-                                "val/diffusion_loss": val_diffusion_loss,
-                            }
-                            accelerator.log(logs, step=global_step)
-                            
-                            logger.info(f"Validation Loss: {val_loss:.4f}")
+                        val_loss += val_total_loss.item()
+                        val_diffusion_loss += val_diff_loss.item()
+                        val_count += 1
+                        
+                        # Limit validation to 20 batches
+                        if val_step >= 19:
+                            break
+                
+                # Calculate average validation loss
+                if val_count > 0:
+                    val_loss /= val_count
+                    val_diffusion_loss /= val_count
                     
-                    # Set model back to training mode
-                    dit_model.train()
+                    # Log validation results
+                    if is_main_process():
+                        logs = {
+                            "val/loss": val_loss,
+                            "val/diffusion_loss": val_diffusion_loss,
+                        }
+                        wandb.log(logs, step=global_step)
+                        
+                        logger.info(f"Validation Loss: {val_loss:.4f}")
+                
+                # Set model back to training mode
+                dit_model.train()
             
             # Check if we've reached max steps
             if global_step >= max_steps:
@@ -1212,13 +1196,9 @@ def train(args):
         logger.info(f"Epoch {epoch+1} completed in {epoch_time:.2f} seconds")
         
         # Save model at the end of each epoch
-        if accelerator.is_main_process:
-            save_path = os.path.join(args.output_dir, f"epoch-{epoch+1}")
-            os.makedirs(save_path, exist_ok=True)
-            
-            unwrapped_model = accelerator.unwrap_model(dit_model)
-            torch.save(unwrapped_model.state_dict(), os.path.join(save_path, "model.pt"))
-            logger.info(f"Saved model for epoch {epoch+1} to {save_path}")
+        checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
+        if is_main_process():
+            logger.info(f"Saved checkpoint to {args.output_dir}/dcp_api/{global_step}")
         
         # Check if we've reached max steps
         if global_step >= max_steps:
@@ -1228,26 +1208,22 @@ def train(args):
     logger.info(f"Training completed after {global_step} steps!")
     
     # Save the final model
-    if accelerator.is_main_process:
-        final_model_path = os.path.join(args.output_dir, "final_model")
+    checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
+    if is_main_process():
+        final_model_path = os.path.join(args.output_dir, f"dcp_api/{global_step}")
         os.makedirs(final_model_path, exist_ok=True)
         
-        unwrapped_model = accelerator.unwrap_model(dit_model)
-        torch.save(unwrapped_model.state_dict(), os.path.join(final_model_path, "model.pt"))
         logger.info(f"Final model saved to {final_model_path}")
 
         # Save LoRA weights separately if using LoRA
         if args.use_lora:
-            lora_state_dict = get_peft_model_state_dict(unwrapped_model)
+            lora_state_dict = get_peft_model_state_dict(dit_model)
             torch.save(
                 lora_state_dict,
                 os.path.join(final_model_path, "lora_weights.pt")
             )
             logger.info(f"Saved final LoRA weights to {final_model_path}/lora_weights.pt")
         
-        # Close wandb run if it was used
-        if args.report_to in ["wandb", "all"] and wandb.run is not None:
-            wandb.finish()
 
 if __name__ == "__main__":
     args = parse_args()

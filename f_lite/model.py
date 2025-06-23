@@ -1,6 +1,7 @@
 # DiT with cross attention
 
 import math
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +13,8 @@ from diffusers.utils.accelerate_utils import apply_forward_hook
 from einops import rearrange
 from peft import get_peft_model_state_dict, set_peft_model_state_dict
 from torch import nn
+from liger_kernel.transformers import LigerRMSNorm, LigerSwiGLUMLP
+from flash_attn_interface import flash_attn_varlen_func
 
 
 def timestep_embedding(t, dim, max_period=10000):
@@ -23,6 +26,67 @@ def timestep_embedding(t, dim, max_period=10000):
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
     return embedding
+
+
+def prepare_flash_attention_inputs(hidden_states, attention_mask=None):
+    """
+    Prepares inputs for flash_attn_varlen_func by flattening and calculating cu_seqlens.
+
+    Args:
+        hidden_states: Tensor of shape (batch_size, max_seqlen, embed_dim)
+        attention_mask: Tensor of shape (batch_size, max_seqlen) (0 for padding, 1 for actual token)
+
+    Returns:
+        flattened_hidden_states: Tensor of shape (total_num_tokens, embed_dim)
+        cu_seqlens: Tensor of shape (batch_size + 1,)
+        max_seqlen_in_batch: Max sequence length in the current batch
+        indices: Indices to re-construct the original padded tensor (for unflattening)
+    """
+    batch_size, max_seqlen_in_batch, embed_dim = hidden_states.shape
+    if attention_mask is None:
+        attention_mask = torch.ones((batch_size, max_seqlen_in_batch), device=hidden_states.device)
+
+    # Calculate actual sequence lengths from the attention mask
+    sequence_lengths = attention_mask.sum(dim=-1, dtype=torch.int32)
+
+    # Create cumulative sequence lengths
+    cu_seqlens = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device=hidden_states.device),
+        sequence_lengths.cumsum(dim=0, dtype=torch.int32)
+    ])
+
+    # Flatten hidden_states to (total_num_tokens, embed_dim)
+    # This removes padding tokens
+    # Using torch.nonzero and index_select is correct for this.
+    indices = torch.nonzero(attention_mask.view(-1), as_tuple=True)[0]
+    flattened_hidden_states = torch.index_select(hidden_states.view(-1, embed_dim), 0, indices)
+
+    return flattened_hidden_states, cu_seqlens, max_seqlen_in_batch, indices
+
+
+def unprepare_flash_attention_outputs(output_flat, indices, batch_size, max_seqlen, hidden_size):
+    """
+    Reconstructs the padded output tensor from the flattened output.
+
+    Args:
+        output_flat: Tensor of shape (total_num_tokens, embed_dim)
+        indices: Indices used during flattening to reconstruct the original shape
+        batch_size: Original batch size
+        max_seqlen: Original maximum sequence length
+        embed_dim: Original embedding dimension
+        dtype: Desired output data type
+        device: Desired output device
+    Returns:
+        padded_output: Tensor of shape (batch_size, max_seqlen, embed_dim)
+    """
+    output = torch.zeros(
+        (batch_size * max_seqlen, hidden_size),
+        dtype=output_flat.dtype,
+        device=output_flat.device
+    )
+    output.index_copy_(0, indices, output_flat) # output_flat should already be (total_tokens, embed_dim)
+    output = output.view(batch_size, max_seqlen, hidden_size)
+    return output
 
 
 class RMSNorm(nn.Module):
@@ -42,6 +106,10 @@ class RMSNorm(nn.Module):
             return (x * norm * self.weight).to(dtype=x_dtype)
         else:
             return (x * norm).to(dtype=x_dtype)
+    
+    def reset_parameters(self):
+        if self.weight is not None:
+            nn.init.ones_(self.weight)
 
 
 class QKNorm(nn.Module):
@@ -57,6 +125,10 @@ class QKNorm(nn.Module):
         k = self.key_norm(k)
         return q, k
 
+    def reset_parameters(self):
+        self.query_norm.reset_parameters()
+        self.key_norm.reset_parameters()
+
 
 class Attention(nn.Module):
     def __init__(
@@ -65,8 +137,6 @@ class Attention(nn.Module):
         num_heads=8,
         qkv_bias=False,
         is_self_attn=True,
-        cross_attn_input_size=None,
-        residual_v=False,
         dynamic_softmax_temperature=False,
     ):
         super().__init__()
@@ -75,30 +145,23 @@ class Attention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
         self.is_self_attn = is_self_attn
-        self.residual_v = residual_v
         self.dynamic_softmax_temperature = dynamic_softmax_temperature
 
         if is_self_attn:
             self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         else:
             self.q = nn.Linear(dim, dim, bias=qkv_bias)
-            self.context_kv = nn.Linear(cross_attn_input_size, dim * 2, bias=qkv_bias)
+            self.context_kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
 
         self.proj = nn.Linear(dim, dim, bias=False)
 
-        if residual_v:
-            self.lambda_param = nn.Parameter(torch.tensor(0.5).reshape(1))
-
         self.qk_norm = QKNorm(self.head_dim)
 
-    def forward(self, x, context=None, v_0=None, rope=None):
+    def forward(self, x, x_cu_seqlens, x_max_seqlen_in_batch, context=None, context_cu_seqlens=None, context_max_seqlen_in_batch=None, rope=None):
         if self.is_self_attn:
             qkv = self.qkv(x)
-            qkv = rearrange(qkv, "b l (k h d) -> k b h l d", k=3, h=self.num_heads)
+            qkv = rearrange(qkv, "l (k h d) -> k h l d", k=3, h=self.num_heads)
             q, k, v = qkv.unbind(0)
-
-            if self.residual_v and v_0 is not None:
-                v = self.lambda_param * v + (1 - self.lambda_param) * v_0
 
             if rope is not None:
                 # print(q.shape, rope[0].shape, rope[1].shape)
@@ -115,76 +178,96 @@ class Attention(nn.Module):
                     ratio = math.sqrt(math.log(token_length) / math.log(1040.0))  # 1024 + 16
                     k = k * ratio
             q, k = self.qk_norm(q, k)
-
+            q = rearrange(q, "h l d -> l h d")
+            k = rearrange(k, "h l d -> l h d")
+            v = rearrange(v, "h l d -> l h d")
+            cu_seqlens_q = x_cu_seqlens
+            cu_seqlens_k = x_cu_seqlens
+            max_seqlen_q = x_max_seqlen_in_batch
+            max_seqlen_k = x_max_seqlen_in_batch
         else:
-            q = rearrange(self.q(x), "b l (h d) -> b h l d", h=self.num_heads)
+            q = rearrange(self.q(x), "l (h d) -> l h d", h=self.num_heads)
             kv = rearrange(
                 self.context_kv(context),
-                "b l (k h d) -> k b h l d",
+                "l (k h d) -> k l h d",
                 k=2,
                 h=self.num_heads,
             )
             k, v = kv.unbind(0)
             q, k = self.qk_norm(q, k)
+            cu_seqlens_q = x_cu_seqlens
+            cu_seqlens_k = context_cu_seqlens
+            max_seqlen_q = x_max_seqlen_in_batch
+            max_seqlen_k = context_max_seqlen_in_batch
 
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b h l d -> b l (h d)")
+        x, _ = flash_attn_varlen_func(
+            q, k, v, 
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.scale
+        )
+        x = rearrange(x, "l h d -> l (h d)")
         x = self.proj(x)
-        return x, v if self.is_self_attn else None
+        return x
+
+    def reset_parameters(self):
+        if hasattr(self, 'qkv'):
+            self.qkv.reset_parameters()
+        if hasattr(self, 'q'):
+            self.q.reset_parameters()
+        if hasattr(self, 'context_kv'):
+            self.context_kv.reset_parameters()
+        self.proj.reset_parameters()
+        self.qk_norm.reset_parameters()
 
 
 class DiTBlock(nn.Module):
     def __init__(
         self,
         hidden_size,
-        cross_attn_input_size,
         num_heads,
+        do_cross_attn=False,
         mlp_ratio=4.0,
         qkv_bias=True,
-        residual_v=False,
         dynamic_softmax_temperature=False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.norm1 = RMSNorm(hidden_size, trainable=qkv_bias)
+        self.norm1 = LigerRMSNorm(hidden_size)
         self.self_attn = Attention(
             hidden_size,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             is_self_attn=True,
-            residual_v=residual_v,
             dynamic_softmax_temperature=dynamic_softmax_temperature,
         )
 
-        if cross_attn_input_size is not None:
-            self.norm2 = RMSNorm(hidden_size, trainable=qkv_bias)
+        if do_cross_attn:
+            self.norm2 = LigerRMSNorm(hidden_size)
             self.cross_attn = Attention(
                 hidden_size,
                 num_heads=num_heads,
                 qkv_bias=qkv_bias,
                 is_self_attn=False,
-                cross_attn_input_size=cross_attn_input_size,
                 dynamic_softmax_temperature=dynamic_softmax_temperature,
             )
         else:
             self.norm2 = None
             self.cross_attn = None
 
-        self.norm3 = RMSNorm(hidden_size, trainable=qkv_bias)
+        self.norm3 = LigerRMSNorm(hidden_size)
         mlp_hidden = int(hidden_size * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden),
-            nn.GELU(),
-            nn.Linear(mlp_hidden, hidden_size),
+        mlp_config = SimpleNamespace(
+            hidden_size=hidden_size,
+            intermediate_size=mlp_hidden,
+            hidden_act="silu",
         )
-
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True))
-
-        self.adaLN_modulation[-1].weight.data.zero_()
-        self.adaLN_modulation[-1].bias.data.zero_()
+        self.mlp = LigerSwiGLUMLP(mlp_config)
 
     # @torch.compile(mode='reduce-overhead')
-    def forward(self, x, context, c, v_0=None, rope=None):
+    def forward(self, x, x_cu_seqlens, x_max_seqlen_in_batch, context, context_cu_seqlens, context_max_seqlen_in_batch, modulation, rope=None):
         (
             shift_sa,
             scale_sa,
@@ -195,35 +278,41 @@ class DiTBlock(nn.Module):
             shift_mlp,
             scale_mlp,
             gate_mlp,
-        ) = self.adaLN_modulation(c).chunk(9, dim=1)
+        ) = modulation
 
-        scale_sa = scale_sa[:, None, :]
-        scale_ca = scale_ca[:, None, :]
-        scale_mlp = scale_mlp[:, None, :]
-
-        shift_sa = shift_sa[:, None, :]
-        shift_ca = shift_ca[:, None, :]
-        shift_mlp = shift_mlp[:, None, :]
-
-        gate_sa = gate_sa[:, None, :]
-        gate_ca = gate_ca[:, None, :]
-        gate_mlp = gate_mlp[:, None, :]
-
-        norm_x = self.norm1(x.clone())
+        norm_x = self.norm1(x)
         norm_x = norm_x * (1 + scale_sa) + shift_sa
-        attn_out, v = self.self_attn(norm_x, v_0=v_0, rope=rope)
+        attn_out = self.self_attn(
+            norm_x, x_cu_seqlens, x_max_seqlen_in_batch, 
+            rope=rope
+        )
         x = x + attn_out * gate_sa
 
         if self.norm2 is not None:
             norm_x = self.norm2(x)
             norm_x = norm_x * (1 + scale_ca) + shift_ca
-            x = x + self.cross_attn(norm_x, context)[0] * gate_ca
+            x = x + self.cross_attn(
+                norm_x, x_cu_seqlens, x_max_seqlen_in_batch, 
+                context, context_cu_seqlens, context_max_seqlen_in_batch
+            ) * gate_ca
 
         norm_x = self.norm3(x)
         norm_x = norm_x * (1 + scale_mlp) + shift_mlp
         x = x + self.mlp(norm_x) * gate_mlp
 
-        return x, v
+        return x
+    
+    def reset_parameters(self):
+        nn.init.ones_(self.norm1.weight)
+        self.self_attn.reset_parameters()
+        if self.norm2 is not None:
+            nn.init.ones_(self.norm2.weight)
+            self.cross_attn.reset_parameters()
+        nn.init.ones_(self.norm3.weight)
+        self.mlp.gate_proj.reset_parameters()
+        self.mlp.up_proj.reset_parameters()
+        self.mlp.down_proj.reset_parameters()
+
 
 
 class PatchEmbed(nn.Module):
@@ -237,26 +326,32 @@ class PatchEmbed(nn.Module):
         x = self.patch_proj(x)
         x = rearrange(x, "b c h w -> b (h w) c")
         return x
+    
+    def reset_parameters(self):
+        self.patch_proj.reset_parameters()
 
 
 class TwoDimRotary(torch.nn.Module):
     def __init__(self, dim, base=10000, h=256, w=256):
         super().__init__()
-        self.inv_freq = torch.FloatTensor([1.0 / (base ** (i / dim)) for i in range(0, dim, 2)])
+        self.dim = dim
+        self.base = base
         self.h = h
         self.w = w
+        
+        inv_freq = torch.FloatTensor([1.0 / (self.base ** (i / self.dim)) for i in range(0, self.dim, 2)])
 
-        t_h = torch.arange(h, dtype=torch.float32)
-        t_w = torch.arange(w, dtype=torch.float32)
+        t_h = torch.arange(self.h, dtype=torch.float32)
+        t_w = torch.arange(self.w, dtype=torch.float32)
 
-        freqs_h = torch.outer(t_h, self.inv_freq).unsqueeze(1)  # h, 1, d / 2
-        freqs_w = torch.outer(t_w, self.inv_freq).unsqueeze(0)  # 1, w, d / 2
-        freqs_h = freqs_h.repeat(1, w, 1)  # h, w, d / 2
-        freqs_w = freqs_w.repeat(h, 1, 1)  # h, w, d / 2
+        freqs_h = torch.outer(t_h, inv_freq).unsqueeze(1)  # h, 1, d / 2
+        freqs_w = torch.outer(t_w, inv_freq).unsqueeze(0)  # 1, w, d / 2
+        freqs_h = freqs_h.repeat(1, self.w, 1)  # h, w, d / 2
+        freqs_w = freqs_w.repeat(self.h, 1, 1)  # h, w, d / 2
         freqs_hw = torch.cat([freqs_h, freqs_w], 2)  # h, w, d
 
-        self.register_buffer("freqs_hw_cos", freqs_hw.cos())
-        self.register_buffer("freqs_hw_sin", freqs_hw.sin())
+        self.register_buffer("freqs_hw_cos", freqs_hw.cos(), persistent=False)
+        self.register_buffer("freqs_hw_sin", freqs_hw.sin(), persistent=False)
 
     def forward(self, x, height_width=None, extend_with_register_tokens=0):
         if height_width is not None:
@@ -288,19 +383,33 @@ class TwoDimRotary(torch.nn.Module):
                 0,
             )
 
-        return cos[None, None, :, :], sin[None, None, :, :]  # [1, 1, T + N, Attn-dim]
+        return cos[None, :, :], sin[None, :, :]  # [1, T + N, Attn-dim]
+
+    def reset_parameters(self):
+        inv_freq = torch.FloatTensor([1.0 / (self.base ** (i / self.dim)) for i in range(0, self.dim, 2)])
+
+        t_h = torch.arange(self.h, dtype=torch.float32)
+        t_w = torch.arange(self.w, dtype=torch.float32)
+
+        freqs_h = torch.outer(t_h, inv_freq).unsqueeze(1)  # h, 1, d / 2
+        freqs_w = torch.outer(t_w, inv_freq).unsqueeze(0)  # 1, w, d / 2
+        freqs_h = freqs_h.repeat(1, self.w, 1)  # h, w, d / 2
+        freqs_w = freqs_w.repeat(self.h, 1, 1)  # h, w, d / 2
+        freqs_hw = torch.cat([freqs_h, freqs_w], 2)  # h, w, d
+        self.freqs_hw_cos[...] = freqs_hw.cos()
+        self.freqs_hw_sin[...] = freqs_hw.sin()
 
 
 def apply_rotary_emb(x, cos, sin):
     orig_dtype = x.dtype
     x = x.to(dtype=torch.float32)
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
+    assert x.ndim == 3  # multihead attention
+    d = x.shape[2] // 2
     x1 = x[..., :d]
     x2 = x[..., d:]
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3).to(dtype=orig_dtype)
+    return torch.cat([y1, y2], 2).to(dtype=orig_dtype)
 
 
 class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  # type: ignore[misc]
@@ -314,7 +423,6 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
         num_heads=16,
         mlp_ratio=4.0,
         cross_attn_input_size=128,
-        residual_v=False,
         train_bias_and_rms=True,
         use_rope=True,
         gradient_checkpoint=False,
@@ -322,6 +430,9 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
         rope_base=10000,
     ):
         super().__init__()
+
+        self.context_proj = nn.Linear(cross_attn_input_size, hidden_size)
+        self.context_norm = LigerRMSNorm(hidden_size)
 
         self.patch_embed = PatchEmbed(patch_size, in_channels, hidden_size)
 
@@ -338,18 +449,21 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
             nn.Linear(4 * hidden_size, hidden_size),
         )
 
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True))
+        self.adaLN_modulation[-1].weight.data.zero_()
+        self.adaLN_modulation[-1].bias.data.zero_()
+
         self.blocks = nn.ModuleList(
             [
                 DiTBlock(
                     hidden_size=hidden_size,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
-                    cross_attn_input_size=cross_attn_input_size,
-                    residual_v=residual_v,
+                    do_cross_attn=(idx % 4 == 0 or idx < 8),     # cross attn every 4 blocks or first 8 blocks
                     qkv_bias=train_bias_and_rms,
                     dynamic_softmax_temperature=dynamic_softmax_temperature,
                 )
-                for _ in range(depth)
+                for idx in range(depth)
             ]
         )
 
@@ -378,8 +492,41 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
         lora_state_dict = torch.load(f"{load_directory}/lora_weights.pt")
         set_peft_model_state_dict(self, lora_state_dict)
 
+    def reset_parameters(self):
+        self.context_proj.reset_parameters()
+        nn.init.ones_(self.context_norm.weight)
+        
+        self.patch_embed.reset_parameters()
+
+        if self.config.use_rope:
+            self.rope.reset_parameters()
+        else:
+            nn.init.zeros_(self.positional_embedding)
+        
+        # register tokens intialze with normal distribution
+        nn.init.normal_(self.register_tokens, mean=0.0, std=0.02)
+        
+        self.time_embed[0].reset_parameters()
+        self.time_embed[2].reset_parameters()
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+        for block in self.blocks:
+            block.reset_parameters()
+        
+        nn.init.zeros_(self.final_modulation[-1].weight)
+        nn.init.zeros_(self.final_modulation[-1].bias)
+        nn.init.zeros_(self.final_proj.weight)
+        nn.init.zeros_(self.final_proj.bias)
+        self.final_norm.reset_parameters()
+
     @apply_forward_hook
-    def forward(self, x, context, timesteps):
+    def forward(self, x, context, context_attn_mask, timesteps):
+        context = self.context_proj(context)
+        context = self.context_norm(context)
+        
+        context_flat, context_cu_seqlens, context_max_seqlen_in_batch, context_indices = prepare_flash_attention_inputs(context, context_attn_mask)
+
         b, c, h, w = x.shape
         x = self.patch_embed(x)  # b, T, d
 
@@ -391,30 +538,39 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
                 extend_with_register_tokens=16,
                 height_width=(h // self.config.patch_size, w // self.config.patch_size),
             )
+            cos = cos.repeat(1, b, 1)
+            sin = sin.repeat(1, b, 1)
         else:
             x = x + self.positional_embedding.repeat(b, 1, 1)[:, : x.shape[1], :]
             cos, sin = None, None
 
+        x_flat, x_cu_seqlens, x_max_seqlen_in_batch, x_indices = prepare_flash_attention_inputs(x)
+
         t_emb = timestep_embedding(timesteps * 1000, self.config.hidden_size).to(x.device, dtype=x.dtype)
         t_emb = self.time_embed(t_emb)
-
-        v_0 = None
+        modulation = self.adaLN_modulation(t_emb).repeat_interleave(
+            16 + h // self.config.patch_size * w // self.config.patch_size, 
+            dim=0
+        ).chunk(9, dim=1)
 
         for _idx, block in enumerate(self.blocks):
             if self.config.gradient_checkpoint:
-                x, v = torch.utils.checkpoint.checkpoint(
+                x_flat = torch.utils.checkpoint.checkpoint(
                     block,
-                    x,
-                    context,
-                    t_emb,
-                    v_0,
+                    x_flat, x_cu_seqlens, x_max_seqlen_in_batch,
+                    context_flat, context_cu_seqlens, context_max_seqlen_in_batch,
+                    modulation,
                     (cos, sin),
                     use_reentrant=False,
                 )
             else:
-                x, v = block(x, context, t_emb, v_0, (cos, sin))
-            if v_0 is None:
-                v_0 = v
+                x_flat = block(
+                    x_flat, x_cu_seqlens, x_max_seqlen_in_batch, 
+                    context_flat, context_cu_seqlens, context_max_seqlen_in_batch, 
+                    modulation, (cos, sin)
+                )
+
+        x = unprepare_flash_attention_outputs(x_flat, x_indices, b, x_max_seqlen_in_batch, self.config.hidden_size)
 
         x = x[:, 16:, :]
         final_shift, final_scale = self.final_modulation(t_emb).chunk(2, dim=1)
@@ -442,7 +598,6 @@ if __name__ == "__main__":
         num_heads=16,
         mlp_ratio=4.0,
         cross_attn_input_size=128,
-        residual_v=False,
         train_bias_and_rms=True,
         use_rope=True,
     ).cuda()
