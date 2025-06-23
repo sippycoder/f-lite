@@ -35,7 +35,7 @@ from f_lite.precomputed_utils import (
 from diffusers import AutoencoderKL
 from transformers import Qwen2_5_VLModel, AutoProcessor
 from f_lite.model import DiT
-from f_lite.sampler import StatefulDistributedSampler
+from f_lite.sampler import ResolutionBucketSampler, StatefulDistributedSampler
 from f_lite.utils import make_image_grid
 
 try:
@@ -182,55 +182,6 @@ def parse_args():
     
     return parser.parse_args()
 
-class ResolutionBucketSampler(torch.utils.data.BatchSampler):
-    """Group images by resolution to ensure consistent resolution within a batch"""
-    
-    def __init__(self, dataset, batch_size, shuffle=True, drop_last=True):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.drop_last = drop_last
-        
-        # Group images by resolution
-        self.buckets = {}
-        for idx in range(len(dataset)):
-            # Get image resolution (faster to get from cache without opening image)
-            with Image.open(dataset.data_entries[idx]["image_path"]) as img:
-                resolution = img.size  # (width, height)
-            
-            if resolution not in self.buckets:
-                self.buckets[resolution] = []
-            self.buckets[resolution].append(idx)
-        
-        print(f"Created {len(self.buckets)} resolution buckets")
-    
-    def __iter__(self):
-        # Create batches within each resolution bucket
-        batches = []
-        for resolution, indices in self.buckets.items():
-            # Shuffle indices within buckets if requested
-            if self.shuffle:
-                indices = random.sample(indices, len(indices))
-            
-            # Create complete batches
-            for i in range(0, len(indices), self.batch_size):
-                batch = indices[i:i+self.batch_size]
-                if len(batch) == self.batch_size or not self.drop_last:  # Handle incomplete batches
-                    batches.append(batch)
-        
-        # Shuffle batch order if requested
-        if self.shuffle:
-            random.shuffle(batches)
-        
-        # Return batch list - note that batches are not flattened here
-        return iter(batches)
-    
-    def __len__(self):
-        if self.drop_last:
-            return sum(len(indices) // self.batch_size for indices in self.buckets.values())
-        else:
-            return sum((len(indices) + self.batch_size - 1) // self.batch_size for indices in self.buckets.values())
-
 
 def create_data_loader(
     data_path,
@@ -245,6 +196,7 @@ def create_data_loader(
     use_resolution_buckets=True,
     num_processes=1,
     process_index=0,
+    sampler_state=None
 ):
     # Set seed for reproducibility if provided
     if seed is not None:
@@ -267,17 +219,24 @@ def create_data_loader(
     
     # Create sampler - either resolution bucket or standard
     if use_resolution_buckets:
-        sampler = ResolutionBucketSampler(dataset, batch_size, shuffle=shuffle)
+        dataset.setup_resolution_buckets(min_side=resolution, max_ratio=1.0 if center_crop else 2.0)
+        sampler = ResolutionBucketSampler(dataset, batch_size, shuffle=shuffle, num_replicas=num_processes, rank=process_index)
+        if sampler_state:
+            sampler.load_state_dict(sampler_state)
         data_loader = DataLoader(
             dataset,
             batch_sampler=sampler,
             num_workers=num_workers,
+            prefetch_factor=4,
             pin_memory=True,
         )
     else:
         # Standard approach
         sampler = StatefulDistributedSampler(dataset, batch_size=batch_size, num_replicas=num_processes, rank=process_index, shuffle=shuffle)
-        
+        if sampler_state:
+            sampler.load_state_dict(sampler_state)
+        logger.info(f"Using StatefulDistributedSampler rank:{process_index}/{num_processes} with {len(sampler)} batches")
+
         data_loader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -917,7 +876,22 @@ def train(args):
     
         checkpointer.load_model(dit_model, last_training_time, checkpoint_path)
         checkpointer.load_optim(dit_model, optimizer, last_training_time, checkpoint_path)
-        checkpointer.load_sampler_state(train_dataloader.sampler, last_training_time, checkpoint_path)
+        sampler_state = checkpointer.load_sampler_state(last_training_time, checkpoint_path)
+        train_dataloader = create_data_loader(
+            data_path=args.train_data_path,
+            batch_size=args.train_batch_size,
+            base_image_dir=args.base_image_dir,
+            shuffle=True,
+            num_workers=4,
+            seed=common_seed,
+            resolution=args.resolution,
+            center_crop=args.center_crop,
+            random_flip=args.random_flip,
+            use_resolution_buckets=args.use_resolution_buckets,
+            num_processes=world_size,
+            process_index=global_rank,
+            sampler_state=sampler_state,
+        )
     else:
         logger.info("No checkpoint found, starting from scratch")
         global_step = 0
@@ -1196,7 +1170,8 @@ Batch size: {args.train_batch_size}\n""")
         logger.info(f"Epoch {epoch+1} completed in {epoch_time:.2f} seconds")
         
         # Save model at the end of each epoch
-        checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
+        sampler_state = train_dataloader.sampler.state_dict(global_step) if not args.use_resolution_buckets else train_dataloader.batch_sampler.state_dict(global_step)
+        checkpointer.save(global_step, dit_model, optimizer, sampler_state)
         if is_main_process():
             logger.info(f"Saved checkpoint to {args.output_dir}/dcp_api/{global_step}")
         
@@ -1208,7 +1183,8 @@ Batch size: {args.train_batch_size}\n""")
     logger.info(f"Training completed after {global_step} steps!")
     
     # Save the final model
-    checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
+    sampler_state = train_dataloader.sampler.state_dict(global_step) if not args.use_resolution_buckets else train_dataloader.batch_sampler.state_dict(global_step)
+    checkpointer.save(global_step, dit_model, optimizer, sampler_state)
     if is_main_process():
         final_model_path = os.path.join(args.output_dir, f"dcp_api/{global_step}")
         os.makedirs(final_model_path, exist_ok=True)

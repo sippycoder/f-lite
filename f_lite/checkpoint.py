@@ -142,7 +142,7 @@ class Checkpointer:
             }
         )
     
-    def load_sampler_state(self, sampler: torch.utils.data.Sampler, iteration=None, checkpoint_path=None):
+    def load_sampler_state(self, iteration=None, checkpoint_path=None):
         if iteration is None and checkpoint_path is None:
             iteration = self.last_training_time
         last_sampler_checkpoint = checkpoint_path or (
@@ -150,8 +150,7 @@ class Checkpointer:
             f"/{iteration}"
         )
         last_sampler_checkpoint = os.path.join(last_sampler_checkpoint, SAMPLER_STATE)
-        sampler_state = torch.load(last_sampler_checkpoint, map_location="cpu")
-        sampler.load_state_dict(sampler_state)
+        return torch.load(last_sampler_checkpoint, map_location="cpu")
 
     def _get_full_model_state_dict(self, model: FSDPModule):
         if self.dcp_api:

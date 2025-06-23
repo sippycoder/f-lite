@@ -31,6 +31,35 @@ Image.MAX_IMAGE_PIXELS = None
 load_dotenv()
 
 
+def center_crop_arr_simulator(orig_image_size, image_size, max_ratio=1.0):
+    """
+    Simulate the crop size calculation from center_crop_arr without creating any images.
+    
+    Args:
+        orig_image_size: Tuple of (height, width) of the original image
+        image_size: Target image size (minimum dimension)
+        max_ratio: Maximum ratio of the dimensions
+    
+    Returns:
+        Tuple of (crop_width, crop_height) that would be used for cropping
+    """
+    # Convert to (width, height) format to match PIL convention
+    current_size = (orig_image_size[1], orig_image_size[0])  # (w, h)
+    
+    # Step 1: Simulate repeated downsampling by 2x while min dimension >= 2 * image_size
+    while min(*current_size) >= 2 * image_size:
+        current_size = tuple(x // 2 for x in current_size)
+    
+    # Step 2: Calculate scale factor to make minimum dimension equal to image_size
+    scale = image_size / min(*current_size)
+    current_size = tuple(round(x * scale) for x in current_size)
+    
+    # Step 3: Use var_center_crop_size_fn to get the final crop size
+    crop_size = var_center_crop_size_fn(current_size, image_size, max_ratio=max_ratio)
+    
+    return (crop_size[1], crop_size[0])
+
+
 def center_crop_arr(pil_image, image_size, max_ratio=1.0):
     """
     Center cropping implementation from ADM.
@@ -72,9 +101,9 @@ def generate_crop_size_list(image_size, max_ratio=2.0):
     return crop_size_list
 
 
-def is_valid_crop_size(cw, ch, orig_w, orig_h):
+def is_valid_crop_size(cw, ch, orig_w, orig_h, eps=1e-7):
     down_scale = max(cw / orig_w, ch / orig_h)
-    return cw <= orig_w * down_scale and ch <= orig_h * down_scale
+    return cw <= orig_w * down_scale + eps and ch <= orig_h * down_scale + eps
 
 
 def var_center_crop_size_fn(orig_img_shape, image_size, max_ratio=2.0):
@@ -93,13 +122,13 @@ def var_center_crop_size_fn(orig_img_shape, image_size, max_ratio=2.0):
         for cw, ch in crop_size_list
     ]
     crop_size = sorted(((x, y) for x, y in zip(rem_percent, crop_size_list) if x > 0), reverse=True)[0][1]
-    return np.array(crop_size, dtype=np.int32)
+    return crop_size
 
 class PolluxImageProcessing:
     def __init__(self, image_size, max_ratio):
         super().__init__()
         # Shared horizontal flip transform
-        self.random_flip = transforms.RandomHorizontalFlip()
+        # self.random_flip = transforms.RandomHorizontalFlip()
 
         # Separate ToTensor and Normalize for x
         self.normalize_transform = transforms.Compose(
@@ -118,7 +147,7 @@ class PolluxImageProcessing:
         x = center_crop_arr(x, self.image_size, self.max_ratio)
 
         # 2. Apply consistent random horizontal flip
-        x = self.random_flip(x) # Flip the PIL image
+        # x = self.random_flip(x) # DO NOT FLIP THE IMAGE - Important for learning text in images
 
         # 4. Apply ToTensor and Normalize separately
         x_normalized = self.normalize_transform(x)
@@ -239,6 +268,21 @@ class ImageDataset(BaseDataset):
         else:
             raise ValueError(f"Invalid scheme: {self.base_url.scheme}")
 
+    def setup_resolution_buckets(self, min_side, max_ratio):
+        self.resolution_buckets = {}
+        logging.info(f"Setting up resolution buckets for {len(self.data)} images ...")
+        for idx in range(len(self.data)):
+            # Get image resolution after var_center_crop_size_fn
+            orig_image_shape = [
+                int(self.data.iloc[idx]["height"]), 
+                int(self.data.iloc[idx]["width"]), 
+            ]
+            resolution = center_crop_arr_simulator(orig_image_shape, min_side, max_ratio)
+            if resolution not in self.resolution_buckets:
+                self.resolution_buckets[resolution] = []
+            self.resolution_buckets[resolution].append(idx)
+        logging.info(f"Created {len(self.resolution_buckets)} resolution buckets with keys: {list(self.resolution_buckets.keys())}")
+
     def http_client(self, imageUrl: str) -> tuple[Image.Image, bool]:
         try:
             imageUrl = urlparse(imageUrl)._replace(netloc=self.base_url.netloc, scheme=self.base_url.scheme).geturl()
@@ -336,6 +380,9 @@ class ImageDataset(BaseDataset):
             return_sample[self.image_column],
             [{
                 "long_caption": return_sample["caption"],
+                # "resolution": tuple(return_sample[self.image_column].shape[1:]),  # hashable tuple
+                # "media_source": sample["media_source"],
+                # "base_model": sample["base_model"] if not pd.isna(sample["base_model"]) else "NA",
             }]
         )
     

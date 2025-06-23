@@ -169,3 +169,143 @@ class StatefulDistributedSampler(Sampler):
             epoch (int): Epoch number.
         """
         self.epoch = epoch
+
+
+
+class ResolutionBucketSampler(torch.utils.data.BatchSampler):
+    """Group images by resolution to ensure consistent resolution within a batch"""
+    
+    def __init__(
+        self, 
+        dataset, 
+        batch_size, 
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        shuffle=True, 
+        drop_last=True,
+        seed: int = 0,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+        
+        # Group images by resolution
+        self.buckets = dataset.resolution_buckets
+        
+        # State management for resumable training
+        self.start_batch_index = 0
+        
+        print(f"Created {len(self.buckets)} resolution buckets with keys: {list(self.buckets.keys())}")
+        print(f"Distributed sampling: rank {rank}/{num_replicas}")
+    
+    def __iter__(self):
+        # Use deterministic shuffling based on epoch and seed
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        
+        # Create batches within each resolution bucket
+        batches = []
+        for resolution, indices in self.buckets.items():
+            # Shuffle indices within buckets if requested
+            if self.shuffle:
+                # Convert to tensor for deterministic shuffling
+                indices_tensor = torch.tensor(indices)
+                shuffled_indices = indices_tensor[torch.randperm(len(indices), generator=g)]
+                indices = shuffled_indices.tolist()
+            
+            # Create complete batches
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i:i+self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:  # Handle incomplete batches
+                    batches.append(batch)
+        
+        # Shuffle batch order if requested
+        if self.shuffle:
+            batch_indices = torch.randperm(len(batches), generator=g).tolist()
+            batches = [batches[i] for i in batch_indices]
+        
+        # Apply distributed sampling if configured
+        if self.num_replicas is not None and self.rank is not None:
+            # Shard batches across replicas
+            batches = batches[self.rank::self.num_replicas]
+        
+        # Apply state-based starting point for resumable training
+        batches = batches[self.start_batch_index:]
+        
+        # Return batch list - note that batches are not flattened here
+        return iter(batches)
+    
+    def __len__(self):
+        # Calculate total number of batches
+        if self.drop_last:
+            total_batches = sum(len(indices) // self.batch_size for indices in self.buckets.values())
+        else:
+            total_batches = sum((len(indices) + self.batch_size - 1) // self.batch_size for indices in self.buckets.values())
+        
+        # Account for distributed sampling
+        if self.num_replicas is not None:
+            # Each replica gets a subset of batches
+            total_batches = (total_batches + self.num_replicas - 1) // self.num_replicas
+        
+        # Account for state-based starting point
+        return max(0, total_batches - self.start_batch_index)
+    
+    def set_epoch(self, epoch: int) -> None:
+        """
+        Set the epoch for this sampler.
+        
+        When :attr:`shuffle=True`, this ensures all replicas
+        use a different random ordering for each epoch. Otherwise, the next iteration of this
+        sampler will yield the same ordering.
+        
+        Args:
+            epoch (int): Epoch number.
+        """
+        self.epoch = epoch
+    
+    def state_dict(self, global_step: int) -> dict:
+        """
+        Get the current state of the sampler for checkpointing.
+        
+        Args:
+            global_step (int): Current global training step
+            
+        Returns:
+            dict: State dictionary containing sampler state
+        """
+        # Calculate current batch index based on global step
+        # This is an approximation - in practice you might want to track this more precisely
+        local_batch_step = global_step % len(self)
+        
+        return {
+            "start_batch_index": local_batch_step,
+            "epoch": self.epoch,
+            "seed": self.seed,
+            "shuffle": self.shuffle,
+        }
+    
+    def load_state_dict(self, state_dict: dict) -> None:
+        """
+        Load the sampler state from a checkpoint.
+        
+        Args:
+            state_dict (dict): State dictionary to load
+        """
+        self.start_batch_index = state_dict.get("start_batch_index", 0)
+        self.epoch = state_dict.get("epoch", 0)
+        self.seed = state_dict.get("seed", self.seed)
+        self.shuffle = state_dict.get("shuffle", self.shuffle)
+    
+    def reset(self, specific_batch_index: int = 0) -> None:
+        """
+        Reset the sampler to a specific batch index.
+        
+        Args:
+            specific_batch_index (int): Batch index to reset to
+        """
+        self.start_batch_index = specific_batch_index
