@@ -46,15 +46,15 @@ def center_crop_arr_simulator(orig_image_size, image_size, max_ratio=1.0):
     current_size = orig_image_size  # (w, h)
     
     # Step 1: Simulate repeated downsampling by 2x while min dimension >= 2 * image_size
-    while min(*current_size) >= 4 * image_size:
-        current_size = tuple(x // 2 for x in current_size)
+    # while min(*current_size) >= 4 * image_size:
+    #     current_size = tuple(x // 2 for x in current_size)
     
-    # Step 2: Calculate scale factor to make minimum dimension equal to image_size
-    scale = image_size / min(*current_size)
-    current_size = tuple(round(x * scale) for x in current_size)
-
-    # Step 3: Use var_center_crop_size_fn to get the final crop size
+    # Step 2: Use var_center_crop_size_fn to get the final crop size
     crop_size = var_center_crop_size_fn(current_size, image_size, max_ratio=max_ratio)
+
+    # # Step 3: Calculate scale factor to make minimum dimension equal to image_size
+    # scale = max(crop_size[0] / current_size[0], crop_size[1] / current_size[1])
+    # current_size = tuple(round(x * scale) for x in current_size)
     
     return crop_size
 
@@ -64,17 +64,13 @@ def center_crop_arr(pil_image, image_size, max_ratio=1.0):
     Center cropping implementation from ADM.
     https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
     """
-    while min(*pil_image.size) >= 4 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
 
     crop_size = var_center_crop_size_fn(pil_image.size, image_size, max_ratio=max_ratio)
+
+    scale = max(crop_size[0] / pil_image.size[0], crop_size[1] / pil_image.size[1])
+    pil_image = pil_image.resize(
+        tuple(round(x * scale) for x in pil_image.size), resample=Image.LANCZOS, reducing_gap=3.0
+    )
 
     crop_y = (pil_image.size[0] - crop_size[0]) // 2
     crop_x = (pil_image.size[1] - crop_size[1]) // 2
@@ -496,11 +492,16 @@ class ImageDataset(BaseDataset):
 
 
 if __name__ == "__main__":
+    os.makedirs("examples", exist_ok=True)
+    collection_name = "train-bucket-4"
+    os.makedirs(f"examples/{collection_name}", exist_ok=True)
+
     dataset = ImageDataset(
-        data_path="train-bucket-1",
+        data_path=collection_name,
         base_image_dir="/fsx/metadata/training",
         root_dir_type="parquet",
         resolution=256,
+        center_crop=False,
         debug=True,
     )
     
@@ -511,11 +512,11 @@ if __name__ == "__main__":
         if idx > 100:
             break
     
-        img_tensor = data[0]
+        img_tensor = data["image"]
         # Un-normalize from [-1, 1] to [0, 1], then scale to [0, 255]
         img_tensor = (img_tensor * 0.5 + 0.5) * 255
         # Permute from (C, H, W) to (H, W, C) and convert to uint8
         img_np = img_tensor.permute(1, 2, 0).numpy().astype(np.uint8)
         # Create and save the image
-        Image.fromarray(img_np).save(f"examples/test{idx}.png")
-        print(f"Saved image {idx} with caption {data[1][0]['long_caption']}")
+        Image.fromarray(img_np).save(f"examples/{collection_name}/test{idx}.png")
+        print(f"Saved image {idx} with caption: \t\n{data['caption']}\n")
