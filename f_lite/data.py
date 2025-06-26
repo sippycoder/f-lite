@@ -6,7 +6,6 @@ import pandas as pd
 import os
 from PIL import Image
 from torchvision import transforms
-# from torchvision.transforms.functional import exif_transpose
 import torch
 import logging
 import time
@@ -36,7 +35,7 @@ def center_crop_arr_simulator(orig_image_size, image_size, max_ratio=1.0):
     Simulate the crop size calculation from center_crop_arr without creating any images.
     
     Args:
-        orig_image_size: Tuple of (height, width) of the original image
+        orig_image_size: Tuple of (width, height) of the original image
         image_size: Target image size (minimum dimension)
         max_ratio: Maximum ratio of the dimensions
     
@@ -44,20 +43,20 @@ def center_crop_arr_simulator(orig_image_size, image_size, max_ratio=1.0):
         Tuple of (crop_width, crop_height) that would be used for cropping
     """
     # Convert to (width, height) format to match PIL convention
-    current_size = (orig_image_size[1], orig_image_size[0])  # (w, h)
+    current_size = orig_image_size  # (w, h)
     
     # Step 1: Simulate repeated downsampling by 2x while min dimension >= 2 * image_size
-    while min(*current_size) >= 2 * image_size:
+    while min(*current_size) >= 4 * image_size:
         current_size = tuple(x // 2 for x in current_size)
     
     # Step 2: Calculate scale factor to make minimum dimension equal to image_size
     scale = image_size / min(*current_size)
     current_size = tuple(round(x * scale) for x in current_size)
-    
+
     # Step 3: Use var_center_crop_size_fn to get the final crop size
     crop_size = var_center_crop_size_fn(current_size, image_size, max_ratio=max_ratio)
     
-    return (crop_size[1], crop_size[0])
+    return crop_size
 
 
 def center_crop_arr(pil_image, image_size, max_ratio=1.0):
@@ -65,7 +64,7 @@ def center_crop_arr(pil_image, image_size, max_ratio=1.0):
     Center cropping implementation from ADM.
     https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
     """
-    while min(*pil_image.size) >= 2 * image_size:
+    while min(*pil_image.size) >= 4 * image_size:
         pil_image = pil_image.resize(
             tuple(x // 2 for x in pil_image.size), resample=Image.BOX
         )
@@ -84,20 +83,35 @@ def center_crop_arr(pil_image, image_size, max_ratio=1.0):
     )
 
 
-def generate_crop_size_list(image_size, max_ratio=2.0):
-    assert max_ratio >= 1.0
-    patch_size = 32     # patch size increments
+# def generate_crop_size_list(image_size, max_ratio=2.0):
+#     assert max_ratio >= 1.0
+#     patch_size = 32     # patch size increments
+#     assert image_size % patch_size == 0
+#     min_wp, min_hp = image_size // patch_size, image_size // patch_size
+#     crop_size_list = []
+#     wp, hp = min_wp, min_hp
+#     while hp / wp <= max_ratio:
+#         crop_size_list.append((wp * patch_size, hp * patch_size))
+#         hp += 1
+#     wp, hp = min_wp + 1, min_hp
+#     while wp / hp <= max_ratio:
+#         crop_size_list.append((wp * patch_size, hp * patch_size))
+#         wp += 1
+#     return crop_size_list
+
+
+def generate_crop_size_list(image_size, max_ratio=2):
+    assert max_ratio >= 1
+    patch_size = 16     # patch size increments
     assert image_size % patch_size == 0
     min_wp, min_hp = image_size // patch_size, image_size // patch_size
+    max_wp, max_hp = image_size * max_ratio // patch_size, image_size * max_ratio // patch_size
     crop_size_list = []
-    wp, hp = min_wp, min_hp
-    while hp / wp <= max_ratio:
-        crop_size_list.append((wp * patch_size, hp * patch_size))
-        hp += 1
-    wp, hp = min_wp + 1, min_hp
-    while wp / hp <= max_ratio:
-        crop_size_list.append((wp * patch_size, hp * patch_size))
+    wp, hp = min_wp, max_hp
+    while wp <= max_wp and hp >= min_hp:
+        crop_size_list.append((round(wp * patch_size), round(hp * patch_size)))
         wp += 1
+        hp -= 1
     return crop_size_list
 
 
@@ -244,7 +258,12 @@ class ImageDataset(BaseDataset):
         self.caption_column = caption_column
         self.image_processing = PolluxImageProcessing(resolution, max_ratio=1.0 if center_crop else 2.0)
         self.retries = 3
-        self.place_holder_image = Image.new("RGB", (resolution, resolution))
+
+        crop_size_list = generate_crop_size_list(resolution, max_ratio=1.0 if center_crop else 2.0)
+        self.place_holder_image = {
+            (w, h): Image.new("RGB", (w, h))
+            for w, h in crop_size_list
+        }
         
         # Create a session with connection pooling and retry strategy
         self.session = requests.Session()
@@ -268,20 +287,32 @@ class ImageDataset(BaseDataset):
         else:
             raise ValueError(f"Invalid scheme: {self.base_url.scheme}")
 
-    def setup_resolution_buckets(self, min_side, max_ratio):
-        self.resolution_buckets = {}
-        logging.info(f"Setting up resolution buckets for {len(self.data)} images ...")
-        for idx in range(len(self.data)):
-            # Get image resolution after var_center_crop_size_fn
-            orig_image_shape = [
-                int(self.data.iloc[idx]["height"]), 
-                int(self.data.iloc[idx]["width"]), 
-            ]
-            resolution = center_crop_arr_simulator(orig_image_shape, min_side, max_ratio)
-            if resolution not in self.resolution_buckets:
-                self.resolution_buckets[resolution] = []
-            self.resolution_buckets[resolution].append(idx)
-        logging.info(f"Created {len(self.resolution_buckets)} resolution buckets with keys: {list(self.resolution_buckets.keys())}")
+    def setup_aspect_ratio_buckets(self, min_side, max_ratio):
+        self.aspect_ratio_buckets = {}
+        logging.info(f"Setting up aspect ratio buckets for {len(self.data)} images ...")
+        time_start = time.time()
+
+        # Create a cache for aspect ratio buckets
+        w_h_array = self.data[["width", "height"]].to_numpy()
+        aspect_ratio_bucket_cache = {}
+        
+        for idx, orig_image_shape in enumerate(w_h_array):
+            orig_image_shape = tuple(orig_image_shape)
+            if orig_image_shape not in aspect_ratio_bucket_cache:  # if not in cache, compute and add to cache
+                # Get image resolution after var_center_crop_size_fn
+                aspect = center_crop_arr_simulator(orig_image_shape, min_side, max_ratio)
+                if aspect not in self.aspect_ratio_buckets:
+                    self.aspect_ratio_buckets[aspect] = []
+                aspect_ratio_bucket_cache[orig_image_shape] = aspect
+            else:  # if in cache, get the aspect ratio from cache
+                aspect = aspect_ratio_bucket_cache[orig_image_shape]
+            self.aspect_ratio_buckets[aspect].append(idx)
+        
+        # Delete the cache
+        del aspect_ratio_bucket_cache
+        
+        setup_time = time.time() - time_start
+        logging.info(f"Created {len(self.aspect_ratio_buckets)} aspect ratio buckets with keys: {list(self.aspect_ratio_buckets.keys())} in {setup_time:.2f} seconds")
 
     def http_client(self, imageUrl: str) -> tuple[Image.Image, bool]:
         try:
@@ -297,7 +328,12 @@ class ImageDataset(BaseDataset):
             
             image = Image.open(io.BytesIO(response.content)).convert("RGB")
             if random.random() > 0.9:
-                self.place_holder_image = image  # frequently update the placeholder image
+                bucket = center_crop_arr_simulator(
+                    (image.width, image.height), 
+                    self.image_processing.image_size, 
+                    self.image_processing.max_ratio
+                )
+                self.place_holder_image[bucket] = image  # frequently update the placeholder image
             return image, True # Signal success
         except (requests.RequestException, IOError) as e:
             status_code = getattr(locals().get('head_response'), 'status_code', 'N/A') # ensure head_response is accessed safely
@@ -311,7 +347,7 @@ class ImageDataset(BaseDataset):
                 logging.debug(f"Error processing image {imageUrl}: {str(e)}")
             
             # Fall back to placeholder image
-            return self.place_holder_image, False # Signal failure
+            return None, False # Signal failure
 
     def s3_client(self, imageUrl: str) -> tuple[Image.Image, bool]:
         S3KEY = os.getenv("S3KEY")
@@ -336,15 +372,19 @@ class ImageDataset(BaseDataset):
             
             image = Image.open(io.BytesIO(image_data)).convert("RGB")
             if random.random() > 0.9:
-                self.place_holder_image = image  # frequently update the placeholder image
+                bucket = center_crop_arr_simulator(
+                    (image.width, image.height), 
+                    self.image_processing.image_size, 
+                    self.image_processing.max_ratio
+                )
+                self.place_holder_image[bucket] = image  # frequently update the placeholder image
             return image, True # Signal success
         except Exception as e: 
             # Catching a broad exception. 
             # For production, you might want to catch more specific Boto3 exceptions like ClientError
             logging.warn(f"Error downloading image from S3 {imageUrl}: {str(e)}")
-            return self.place_holder_image, False # Signal failure
+            return None, False # Signal failure
 
-        
     def dummy_client(self, imageUrl: str) -> tuple[Image.Image, bool]:
         return self.place_holder_image, True # Signal success
 
@@ -371,37 +411,86 @@ class ImageDataset(BaseDataset):
             return_sample[self.image_column] = self.image_processing.transform(image)
         else:
             # Fall back to placeholder image
-            return_sample[self.image_column] = self.image_processing.transform(image) # image is placeholder here
+            expected_w, expected_h = center_crop_arr_simulator(
+                (int(sample["width"]), int(sample["height"])), 
+                self.image_processing.image_size, 
+                self.image_processing.max_ratio
+            )
+            place_holder_image = self.place_holder_image[(expected_w, expected_h)]
+            return_sample[self.image_column] = self.image_processing.transform(place_holder_image) # image is placeholder here
             return_sample["_id"] = "-1"
             return_sample["caption"] = ""
         
         # Return image and metadata
-        return (
-            return_sample[self.image_column],
-            [{
-                "long_caption": return_sample["caption"],
-                # "resolution": tuple(return_sample[self.image_column].shape[1:]),  # hashable tuple
-                # "media_source": sample["media_source"],
-                # "base_model": sample["base_model"] if not pd.isna(sample["base_model"]) else "NA",
-            }]
-        )
+        return {
+            "image": return_sample[self.image_column],
+            "index": idx,
+            "caption": return_sample["caption"],
+            "media_source": sample["media_source"],
+            "media_type": sample["media_type"],
+        }
     
     def __del__(self):
         # Clean up the session when the dataset object is destroyed
         if hasattr(self, 'session'):
             self.session.close()
-            
+
     def collate_fn(self, batch):
+        """
+        Custom collate_fn that ensures all image tensors have the same shape.
+
+        If images in the incoming batch have different spatial resolutions (e.g. due to
+        a rare bucket assignment mismatch) the minority-shape samples are replaced by
+        randomly selected samples drawn from the majority-shape subset **together with
+        all of their metadata**. This guarantees that, after the fix-up step, every
+        image tensor in the batch can be safely stacked with `torch.stack`.
+        """
+
+        # ------------------------------------------------------------------
+        # 1) Detect shape mismatch inside the batch
+        # ------------------------------------------------------------------
+        image_shapes = [sample["image"].shape for sample in batch]
+        if len(set(image_shapes)) > 1:
+            logging.info(f"Found {len(set(image_shapes))} different image shapes in the batch: {set(image_shapes)}")
+            # There is at least one outlier – compute the majority shape.
+            from collections import Counter
+
+            shape_counter = Counter(image_shapes)
+            # Select the most common shape (if there is a tie, random.choice breaks it)
+            max_freq = max(shape_counter.values())
+            majority_shapes = [s for s, c in shape_counter.items() if c == max_freq]
+            majority_shape = random.choice(majority_shapes)
+
+            # Pre-compute indices of samples that already have the majority shape
+            majority_indices = [i for i, s in enumerate(image_shapes) if s == majority_shape]
+
+            # Iterate through the batch and patch minority samples
+            for idx, shape in enumerate(image_shapes):
+                if shape != majority_shape:
+                    logging.info(f"Patching minority sample {batch[idx]['index']} with shape {shape} with majority shape {majority_shape}")
+                    # Randomly pick a donor sample with the majority shape and clone it
+                    donor_idx = random.choice(majority_indices)
+                    batch[idx] = batch[donor_idx]
+
+            # Update image_shapes – now they should all be identical
+            image_shapes = [sample["image"].shape for sample in batch]
+
+            # Sanity check (avoid silent errors in the future)
+            assert len(set(image_shapes)) == 1, "Failed to homogenise image shapes in collate_fn"
+
+        # ------------------------------------------------------------------
+        # 2) Standard collation – now every tensor is guaranteed to have the same shape
+        # ------------------------------------------------------------------
         return_batch = {}
         for k in batch[0].keys():
             items = [item[k] for item in batch]
-            # Check if all items are tensors and have the same shape
-            if all(isinstance(item, torch.Tensor) for item in items) and all(item.shape == items[0].shape for item in items):
-                # Stack tensors if they all have the same shape
+            if all(isinstance(item, torch.Tensor) for item in items):
+                # All tensors now share the same shape → safe to stack
                 return_batch[k] = torch.stack(items, dim=0)
             else:
-                # Keep as list if not tensors or different shapes
+                # Non-tensor data (e.g. caption strings) – keep as list
                 return_batch[k] = items
+
         return return_batch
 
 

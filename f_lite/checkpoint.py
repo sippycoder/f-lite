@@ -150,7 +150,10 @@ class Checkpointer:
             f"/{iteration}"
         )
         last_sampler_checkpoint = os.path.join(last_sampler_checkpoint, SAMPLER_STATE)
-        return torch.load(last_sampler_checkpoint, map_location="cpu")
+        if os.path.exists(last_sampler_checkpoint):
+            return torch.load(last_sampler_checkpoint, map_location="cpu")
+        else:
+            return None
 
     def _get_full_model_state_dict(self, model: FSDPModule):
         if self.dcp_api:

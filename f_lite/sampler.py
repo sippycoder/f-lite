@@ -194,13 +194,13 @@ class ResolutionBucketSampler(torch.utils.data.BatchSampler):
         self.seed = seed
         self.epoch = 0
         
-        # Group images by resolution
-        self.buckets = dataset.resolution_buckets
+        # Group images by aspect ratio
+        self.buckets = dataset.aspect_ratio_buckets
         
         # State management for resumable training
         self.start_batch_index = 0
         
-        print(f"Created {len(self.buckets)} resolution buckets with keys: {list(self.buckets.keys())}")
+        print(f"Created {len(self.buckets)} aspect ratio buckets with keys: {list(self.buckets.keys())}")
         print(f"Distributed sampling: rank {rank}/{num_replicas}")
     
     def __iter__(self):
@@ -208,9 +208,9 @@ class ResolutionBucketSampler(torch.utils.data.BatchSampler):
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
         
-        # Create batches within each resolution bucket
+        # Create batches within each aspect ratio bucket
         batches = []
-        for resolution, indices in self.buckets.items():
+        for aspect, indices in self.buckets.items():
             # Shuffle indices within buckets if requested
             if self.shuffle:
                 # Convert to tensor for deterministic shuffling

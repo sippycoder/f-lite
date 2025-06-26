@@ -219,7 +219,7 @@ def create_data_loader(
     
     # Create sampler - either resolution bucket or standard
     if use_resolution_buckets:
-        dataset.setup_resolution_buckets(min_side=resolution, max_ratio=1.0 if center_crop else 2.0)
+        dataset.setup_aspect_ratio_buckets(min_side=resolution, max_ratio=1.0 if center_crop else 2.0)
         sampler = ResolutionBucketSampler(dataset, batch_size, shuffle=shuffle, num_replicas=num_processes, rank=process_index)
         if sampler_state:
             sampler.load_state_dict(sampler_state)
@@ -229,6 +229,7 @@ def create_data_loader(
             num_workers=num_workers,
             prefetch_factor=4,
             pin_memory=True,
+            collate_fn=dataset.collate_fn,
         )
     else:
         # Standard approach
@@ -249,16 +250,20 @@ def create_data_loader(
     
     return data_loader
 
-def _convert_caption_to_messages(caption: str, processor: AutoProcessor) -> str:
+def _convert_caption_to_messages(caption: str, metadata: dict, processor: AutoProcessor) -> str:
+    system_prompt = "You are an assistant designed to generate high-quality images based on user prompts. Generate images that are realistic and high-quality."
+    if metadata is not None and metadata.get("media_type", "real") != "real":
+        system_prompt = "You are an assistant designed to generate high-quality images based on user prompts. The image doesn't need to be realistic, but it should be high-quality."
+
     messages = [
         {
             "role": "system",
-            "content": "You are a text-to-image generation model engineered to transform user-provided textual captions directly into high-quality, visually rich image tokens. Your core objective is to generate the best possible, highest-fidelity image that creatively interprets and expands upon the user's intent while maintaining strong semantic alignment with the original caption. You are designed for maximum visual quality, artistic flair, and implicit adherence to best practices in image generation (e.g., proper anatomy, clear focus, compelling composition), ensuring a stunning visual result from even concise descriptions.",
+            "content": system_prompt,
         },
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": caption},
+                {"type": "text", "text": f"Caption: \n\n{caption}"},
             ],
         },
     ]
@@ -274,6 +279,7 @@ def encode_prompt_with_qwen2_5_vl(
     processor,
     max_sequence_length=512,
     prompt=None,
+    metadata=None,    # dict of metadata to add to the prompt
     num_images_per_prompt=1,
     device=None,
     return_index=-8,
@@ -281,7 +287,13 @@ def encode_prompt_with_qwen2_5_vl(
     prompt = [prompt] if isinstance(prompt, str) else prompt
     batch_size = len(prompt)
 
-    messages = [_convert_caption_to_messages(p, processor) for p in prompt]
+    # convert batch metadata {key: list of values} to metadata dictionary per prompt [{key: value}]
+    if metadata is not None:
+        metadata = [{k: v[i] for k, v in metadata.items()} for i in range(len(prompt))]
+    else:
+        metadata = [None] * len(prompt)
+
+    messages = [_convert_caption_to_messages(p, m, processor) for p, m in zip(prompt, metadata)]
 
     inputs = processor(
         text=messages,
@@ -343,10 +355,10 @@ def forward(
         batch_size: Target batch size
         return_index: Index to return from encoded text
     """
-    (images_vae, metadatas) = batch
+    images_vae = batch.pop("image")
 
     # Get captions from metadata
-    captions = metadatas[0]["long_caption"]
+    captions = batch.pop("caption")
 
     # Process images and captions
     # preprocess_start = time.time()
@@ -626,6 +638,9 @@ def train(args):
             name=run_name,
             config=vars(args),
         )
+
+        # log the code in f_lite directory
+        wandb.log({"code": wandb.Code(os.path.abspath("f_lite"))})
     
     if args.pretrained_model_path is not None:
         logger.info(f"Loading model from {args.pretrained_model_path}")
@@ -861,7 +876,7 @@ def train(args):
     
     os.makedirs(args.output_dir, exist_ok=True)
     checkpointer = Checkpointer(args.output_dir, dcp_api=True)
-    if args.resume_from_checkpoint and checkpointer.last_training_time:
+    if args.resume_from_checkpoint:
         checkpoint_path = args.resume_from_checkpoint
         last_training_time = None
         
@@ -914,16 +929,18 @@ def train(args):
     dit_model.train()
 
     dataset = train_dataloader.dataset
-    print(f"""\nDataset size: {len(dataset)} images
-Dataloader batches: {len(train_dataloader)}
-Calculated max steps: {len(train_dataloader) * args.num_epochs // args.gradient_accumulation_steps}
-World size: {get_world_size()}
-Local rank: {get_local_rank()}
-Global rank: {get_global_rank()}
-Is main process: {is_main_process()}
-Device mesh: {device_mesh}
-Device: {device}
-Batch size: {args.train_batch_size}\n""")
+    print(
+        f"\nDataset size:       {len(dataset)} images"
+        f"\nDataloader batches:   {len(train_dataloader)}"
+        f"\nCalculated max steps: {len(train_dataloader) * args.num_epochs // args.gradient_accumulation_steps}"
+        f"\nWorld size:           {get_world_size()}"
+        f"\nLocal rank:           {get_local_rank()}"
+        f"\nGlobal rank:          {get_global_rank()}"
+        f"\nIs main process:      {is_main_process()}"
+        f"\nDevice mesh:          {device_mesh}"
+        f"\nDevice:               {device}"
+        f"\nBatch size:           {args.train_batch_size}\n"
+    )
     for epoch in range(args.num_epochs):
         logger.info(f"Starting epoch {epoch+1}/{args.num_epochs}")
         
@@ -1032,7 +1049,8 @@ Batch size: {args.train_batch_size}\n""")
             
             # Save checkpoint
             if global_step % args.checkpointing_steps == 0:
-                checkpointer.save(global_step, dit_model, optimizer, train_dataloader.sampler.state_dict(global_step))
+                sampler_state = train_dataloader.sampler.state_dict(global_step) if not args.use_resolution_buckets else train_dataloader.batch_sampler.state_dict(global_step)
+                checkpointer.save(global_step, dit_model, optimizer, sampler_state)
                 if is_main_process():
                     logger.info(f"Saved checkpoint to {args.output_dir}/dcp_api/{global_step}")
 
@@ -1079,8 +1097,8 @@ Batch size: {args.train_batch_size}\n""")
                         device=device,
                         global_step=global_step,
                         prompts=None,  # Use default prompts as fallback
-                        image_width=256,
-                        image_height=256,
+                        image_width=384,
+                        image_height=384,
                         prompts_per_gpu=2,
                         prompts_file=args.sample_prompts_file,
                     )
