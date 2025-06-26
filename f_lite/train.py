@@ -183,6 +183,54 @@ def parse_args():
     return parser.parse_args()
 
 
+def create_dataloader_with_dataset(
+    dataset,
+    batch_size,
+    shuffle=True,
+    num_workers=4,
+    seed=None,
+    resolution=None,
+    center_crop=False,
+    random_flip=False,
+    use_resolution_buckets=True,
+    num_processes=1,
+    process_index=0,
+    sampler_state=None
+):
+    # Create sampler - either resolution bucket or standard
+    if use_resolution_buckets:
+        dataset.setup_aspect_ratio_buckets(min_side=resolution, max_ratio=1.0 if center_crop else 2.0)
+        sampler = ResolutionBucketSampler(dataset, batch_size, shuffle=shuffle, num_replicas=num_processes, rank=process_index)
+        if sampler_state:
+            sampler.load_state_dict(sampler_state)
+        data_loader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=num_workers,
+            prefetch_factor=4,
+            pin_memory=True,
+            collate_fn=dataset.collate_fn,
+        )
+    else:
+        # Standard approach
+        sampler = StatefulDistributedSampler(dataset, batch_size=batch_size, num_replicas=num_processes, rank=process_index, shuffle=shuffle)
+        if sampler_state:
+            sampler.load_state_dict(sampler_state)
+        logger.info(f"Using StatefulDistributedSampler rank:{process_index}/{num_processes} with {len(sampler)} batches")
+
+        data_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            prefetch_factor=4,
+            pin_memory=True,
+            drop_last=True,
+        )
+    
+    return data_loader
+
+
 def create_data_loader(
     data_path,
     batch_size,
@@ -217,38 +265,20 @@ def create_data_loader(
         debug=args.debug
     )
     
-    # Create sampler - either resolution bucket or standard
-    if use_resolution_buckets:
-        dataset.setup_aspect_ratio_buckets(min_side=resolution, max_ratio=1.0 if center_crop else 2.0)
-        sampler = ResolutionBucketSampler(dataset, batch_size, shuffle=shuffle, num_replicas=num_processes, rank=process_index)
-        if sampler_state:
-            sampler.load_state_dict(sampler_state)
-        data_loader = DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=num_workers,
-            prefetch_factor=4,
-            pin_memory=True,
-            collate_fn=dataset.collate_fn,
-        )
-    else:
-        # Standard approach
-        sampler = StatefulDistributedSampler(dataset, batch_size=batch_size, num_replicas=num_processes, rank=process_index, shuffle=shuffle)
-        if sampler_state:
-            sampler.load_state_dict(sampler_state)
-        logger.info(f"Using StatefulDistributedSampler rank:{process_index}/{num_processes} with {len(sampler)} batches")
-
-        data_loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            sampler=sampler,
-            num_workers=num_workers,
-            prefetch_factor=4,
-            pin_memory=True,
-            drop_last=True,
-        )
-    
-    return data_loader
+    return create_dataloader_with_dataset(
+        dataset,
+        batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        seed=seed,
+        resolution=resolution,
+        center_crop=center_crop,
+        random_flip=random_flip,
+        use_resolution_buckets=use_resolution_buckets,
+        num_processes=num_processes,
+        process_index=process_index,
+        sampler_state=sampler_state
+    )
 
 def _convert_caption_to_messages(caption: str, metadata: dict, processor: AutoProcessor) -> str:
     system_prompt = "You are an assistant designed to generate high-quality images based on user prompts. Generate images that are realistic and high-quality."
@@ -637,10 +667,8 @@ def train(args):
             project=args.project_name,
             name=run_name,
             config=vars(args),
+            save_code=True,
         )
-
-        # log the code in f_lite directory
-        wandb.log({"code": wandb.Code(os.path.abspath("f_lite"))})
     
     if args.pretrained_model_path is not None:
         logger.info(f"Loading model from {args.pretrained_model_path}")
@@ -828,7 +856,7 @@ def train(args):
     optimizer = optimizer_class(
         dit_model.parameters(),
         lr=args.learning_rate,
-        betas=(0.9, 0.95),
+        betas=(0.9, 0.999),
         weight_decay=args.weight_decay,
         fused=True,
     )
@@ -892,13 +920,11 @@ def train(args):
         checkpointer.load_model(dit_model, last_training_time, checkpoint_path)
         checkpointer.load_optim(dit_model, optimizer, last_training_time, checkpoint_path)
         sampler_state = checkpointer.load_sampler_state(last_training_time, checkpoint_path)
-        train_dataloader = create_data_loader(
-            data_path=args.train_data_path,
+        train_dataloader = create_dataloader_with_dataset(
+            dataset=train_dataloader.dataset,
             batch_size=args.train_batch_size,
-            base_image_dir=args.base_image_dir,
             shuffle=True,
             num_workers=4,
-            seed=common_seed,
             resolution=args.resolution,
             center_crop=args.center_crop,
             random_flip=args.random_flip,
