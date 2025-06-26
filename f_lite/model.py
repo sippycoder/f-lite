@@ -403,6 +403,8 @@ class TwoDimRotary(torch.nn.Module):
 def apply_rotary_emb(x, cos, sin):
     orig_dtype = x.dtype
     x = x.to(dtype=torch.float32)
+    cos = cos.to(dtype=torch.float32)
+    sin = sin.to(dtype=torch.float32)
     assert x.ndim == 3  # multihead attention
     d = x.shape[2] // 2
     x1 = x[..., :d]
@@ -554,7 +556,7 @@ class DiT(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):  #
         ).chunk(9, dim=1)
 
         for _idx, block in enumerate(self.blocks):
-            if self.config.gradient_checkpoint:
+            if self.config.gradient_checkpoint and _idx >= 8:  # try to checkpoint non-cross-attn blocks
                 x_flat = torch.utils.checkpoint.checkpoint(
                     block,
                     x_flat, x_cu_seqlens, x_max_seqlen_in_batch,
